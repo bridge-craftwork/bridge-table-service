@@ -170,7 +170,11 @@ async fn delete_session(
     }
     let Some(session) = state.rooms.remove_session(&id).await else {
         // Idempotent: closing an unknown/already-closed session succeeds.
-        return (StatusCode::OK, Json(json!({ "ok": true, "removed": false }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "removed": false })),
+        )
+            .into_response();
     };
     // Tell everyone at the tables; connections hang up on this event.
     for room in &session.rooms {

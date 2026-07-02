@@ -130,8 +130,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
     // Session routing: the ticket names the session; "demo" is the standing
     // dev room (no admin setup required).
     if let Some(session) = state.rooms.get_session(&hello.ticket.session_id).await {
-        let is_teacher =
-            hello.ticket.sub == session.owner_sub || hello.ticket.role == "teacher";
+        let is_teacher = hello.ticket.sub == session.owner_sub || hello.ticket.role == "teacher";
         if is_teacher {
             handle_teacher(socket, state, session, hello).await;
         } else {
@@ -155,12 +154,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
 // Session player connections
 // ---------------------------------------------------------------------------
 
-async fn handle_player(
-    socket: WebSocket,
-    state: SharedState,
-    session: Arc<Session>,
-    hello: Hello,
-) {
+async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Session>, hello: Hello) {
     let ticket = hello.ticket;
     let placement = session.place(&ticket.sub, &ticket.name).await;
     let mut room: Arc<Room> = session.rooms[placement.room_idx].clone();
@@ -291,16 +285,8 @@ async fn handle_player(
     tracing::info!(event = "ws_left", sub = %ticket.sub, room = %room.id, session = %session.id, "");
 }
 
-fn welcome_msg(
-    session: &Session,
-    room: &Room,
-    ticket: &Ticket,
-    seat: Option<Direction>,
-) -> String {
-    let bot_mode = if room
-        .random_bots
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+fn welcome_msg(session: &Session, room: &Room, ticket: &Ticket, seat: Option<Direction>) -> String {
+    let bot_mode = if room.random_bots.load(std::sync::atomic::Ordering::Relaxed) {
         "random"
     } else {
         "real"
@@ -570,7 +556,11 @@ async fn handle_teacher_msg(
                 return Some(err_msg("bad_seat", "seat missing or unrecognized"));
             };
             // boot ≡ assign_seat with sub:null.
-            let sub = if v["t"] == "boot" { None } else { v["sub"].as_str() };
+            let sub = if v["t"] == "boot" {
+                None
+            } else {
+                v["sub"].as_str()
+            };
             match session.assign_seat(table_id, seat, sub).await {
                 Ok(changed) => {
                     for idx in changed {

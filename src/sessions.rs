@@ -238,13 +238,7 @@ impl Session {
         let (notify, _) = broadcast::channel(64);
         Arc::new_cyclic(|weak: &Weak<Session>| {
             let rooms = (1..=table_count)
-                .map(|i| {
-                    Room::new(
-                        format!("{id}-t{i}"),
-                        boards[0].clone(),
-                        Some(weak.clone()),
-                    )
-                })
+                .map(|i| Room::new(format!("{id}-t{i}"), boards[0].clone(), Some(weak.clone())))
                 .collect();
             Session {
                 id,
@@ -342,8 +336,12 @@ impl Session {
             SeatPolicy::FirstFree => {
                 // South first — the traditional student seat (matches the
                 // demo room's seat_or_rebind order).
-                const FILL_ORDER: [Direction; 4] =
-                    [Direction::South, Direction::West, Direction::North, Direction::East];
+                const FILL_ORDER: [Direction; 4] = [
+                    Direction::South,
+                    Direction::West,
+                    Direction::North,
+                    Direction::East,
+                ];
                 let start = self.next_arrival.fetch_add(1, Ordering::SeqCst);
                 self.seat_round_robin(start, &FILL_ORDER, sub, name).await
             }
@@ -356,8 +354,7 @@ impl Session {
             },
             None => {
                 // Kibitz: attach round-robin so viewers spread out.
-                let room_idx =
-                    self.next_arrival.fetch_add(1, Ordering::SeqCst) % self.rooms.len();
+                let room_idx = self.next_arrival.fetch_add(1, Ordering::SeqCst) % self.rooms.len();
                 self.kibitzers.lock().await.insert(
                     sub.to_string(),
                     Kibitzer {
@@ -792,7 +789,10 @@ mod tests {
     async fn all_bot_table_only_force_advances() {
         let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
         let room = s.rooms[0].clone();
-        assert!(!s.try_advance(&room, false).await, "no humans: no auto-advance");
+        assert!(
+            !s.try_advance(&room, false).await,
+            "no humans: no auto-advance"
+        );
         assert!(s.try_advance(&room, true).await, "teacher force works");
     }
 
