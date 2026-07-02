@@ -270,9 +270,11 @@ async fn act_once(room: &Room) -> bool {
             calls,
         } => {
             let (call, via) = match mode {
-                BotMode::Real => choose_call(room, &board, &calls).await,
+                // Rules mode still bids with BBA — the rulebot is cardplay
+                // only, and all-pass auctions made the mode useless for
+                // watching the bot defend real contracts (Rick, 2026-07-02).
+                BotMode::Real | BotMode::Rules => choose_call(room, &board, &calls).await,
                 BotMode::Random => (Call::Pass, "random"),
-                BotMode::Rules => (Call::Pass, "rules"),
             };
             (seq, Action::Call { seat, call }, via, false)
         }

@@ -48,8 +48,8 @@ pub enum BotMode {
     Real = 0,
     /// Instant deterministic RandomLegal cardplay, Pass bidding. Testing.
     Random = 1,
-    /// Instant rule-based cardplay (bridge-rulebot), Pass bidding — watch
-    /// the rulebot play without BBA/BEN in the loop.
+    /// BBA bidding + instant rule-based cardplay (bridge-rulebot) — watch
+    /// the rulebot defend real contracts without BEN in the loop.
     Rules = 2,
 }
 
