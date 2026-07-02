@@ -547,6 +547,25 @@ impl Session {
         for room in &self.rooms {
             let inner = room.state.lock().await;
             let f = inner.table.fold();
+            let hands = {
+                let mut hands = serde_json::Map::new();
+                let complete = f.phase == crate::table::Phase::Complete;
+                for seat in bridge_types::Direction::ALL {
+                    let cards = if complete {
+                        inner.table.board.deal.hand(seat).cards().to_vec()
+                    } else {
+                        inner.table.remaining(seat, &f)
+                    };
+                    hands.insert(
+                        seat.to_char().to_string(),
+                        json!(cards
+                            .iter()
+                            .map(|c| format!("{}{}", c.suit.to_char(), c.rank.to_char()))
+                            .collect::<Vec<_>>()),
+                    );
+                }
+                Value::Object(hands)
+            };
             tables.push(json!({
                 "table_id": room.id,
                 "board_no": inner.table.board.number,
@@ -564,6 +583,27 @@ impl Session {
                     .iter()
                     .map(|d| d.to_char().to_string())
                     .collect::<Vec<_>>(),
+                // Multi-table monitor payload (teacher-only feed): enough to
+                // render a live mini-table per room — dealer/vul, the
+                // auction, contract, each seat's remaining cards, and the
+                // trick in progress. ~1-2KB per table per update; the lobby
+                // is already rebuilt on every action at any table.
+                "dealer": inner.table.board.dealer.to_char().to_string(),
+                "vulnerable": inner.table.board.vulnerable.to_pbn(),
+                "auction": f.calls.iter().map(|c| c.to_pbn()).collect::<Vec<_>>(),
+                "contract": f.contract.as_ref().map(|c| json!({
+                    "text": c.to_pbn(),
+                    "declarer": c.declarer.to_char().to_string(),
+                })),
+                "hands": hands,
+                "current_trick": f.current_trick.as_ref().map(|(leader, plays)| json!({
+                    "leader": leader.to_char().to_string(),
+                    "plays": plays.iter().map(|(s, c)| json!({
+                        "seat": s.to_char().to_string(),
+                        "card": format!("{}{}", c.suit.to_char(), c.rank.to_char()),
+                    })).collect::<Vec<_>>(),
+                })),
+                "result": inner.table.board_result_json(),
             }));
         }
         let kibitzers: Vec<Value> = {
