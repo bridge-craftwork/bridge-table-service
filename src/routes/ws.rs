@@ -824,16 +824,22 @@ async fn handle_client_msg(
             let mut inner = room.state.lock().await;
             // Server-authoritative seat resolution: a play always targets the
             // seat on turn. The sender is entitled if that's their own seat,
-            // or if they're the declarer and the seat on turn is the dummy
-            // (declarer plays dummy's cards).
+            // or if they control the declarer side and the seat on turn is a
+            // declarer-side seat (declarer plays dummy's cards; a human
+            // dummy plays the hand for a bot declarer).
             let f = inner.table.fold();
             let Some(turn_seat) = f.next_to_act else {
                 return Some(err_msg("rejected", "no one is on turn"));
             };
             let entitled = turn_seat == seat
-                || f.contract
-                    .as_ref()
-                    .is_some_and(|c| c.declarer == seat && turn_seat == c.dummy());
+                || f.contract.as_ref().is_some_and(|c| {
+                    (turn_seat == c.declarer || turn_seat == c.dummy())
+                        && inner.declarer_side_controller(
+                            c.declarer,
+                            true,
+                            std::time::Instant::now(),
+                        ) == seat
+                });
             if !entitled {
                 return Some(err_msg("rejected", "not your turn"));
             }

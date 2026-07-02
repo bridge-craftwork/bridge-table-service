@@ -267,6 +267,27 @@ impl RoomInner {
     /// table is waiting on this seat, `TAKEOVER_AFTER` otherwise). The seat
     /// binding is untouched — a reconnect (seat_or_rebind) instantly returns
     /// control to the human. `now` is injected for testability.
+    /// Who controls a declarer-side seat's cards during play. Bridge:
+    /// declarer plays dummy's cards. Teaching twist (Shark-style, Rick
+    /// 2026-07-02): when the DECLARER seat is bot-controlled but a human
+    /// sits at dummy, that human plays the hand — declarer's cards and
+    /// dummy's both.
+    pub fn declarer_side_controller(
+        &self,
+        declarer: Direction,
+        on_turn: bool,
+        now: Instant,
+    ) -> Direction {
+        if !self.seat_bot_controlled(declarer, on_turn, now) {
+            return declarer;
+        }
+        let dummy = declarer.partner();
+        if !self.seat_bot_controlled(dummy, on_turn, now) {
+            return dummy;
+        }
+        declarer
+    }
+
     pub fn seat_bot_controlled(&self, seat: Direction, on_turn: bool, now: Instant) -> bool {
         let Some(occ) = self.seats.get(&seat) else {
             return true; // empty seat: always a bot
@@ -532,6 +553,23 @@ mod tests {
             inner.seat_or_rebind(sub, sub);
         }
         inner
+    }
+
+    #[test]
+    fn declarer_side_controller_prefers_declarer_then_human_dummy() {
+        use Direction::*;
+        let now = Instant::now();
+        // u1 → South (declarer), u2 → West, u3 → North (dummy), u4 → East.
+        let mut inner = inner_with(&["u1", "u2", "u3", "u4"]);
+        assert_eq!(inner.declarer_side_controller(South, true, now), South);
+
+        // Declarer seat empty (bot): the human dummy plays the hand.
+        inner.seats.remove(&South);
+        assert_eq!(inner.declarer_side_controller(South, true, now), North);
+
+        // Both bot: the bot declarer drives.
+        inner.seats.remove(&North);
+        assert_eq!(inner.declarer_side_controller(South, true, now), South);
     }
 
     #[test]

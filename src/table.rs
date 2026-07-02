@@ -270,9 +270,16 @@ impl TableState {
     /// shows every seat's ORIGINAL hand to everyone (post-mortem review —
     /// the remaining cards would all be empty anyway). Hidden hands are
     /// reported as card *counts* so the UI can render card backs.
+    ///
+    /// The DUMMY also sees the declarer's hand once the opening lead is
+    /// made (Rick 2026-07-02): with a human declarer the dummy "plays
+    /// along" mentally instead of watching the hand unfold card by card,
+    /// and with a bot declarer the human dummy actually plays the hand
+    /// (see rooms::declarer_side_controller) so they must see it.
     pub fn snapshot(&self, viewer_seat: Option<Direction>, see_all: bool) -> Value {
         let f = self.fold();
         let dummy = f.contract.as_ref().map(|c| c.dummy());
+        let declarer = f.contract.as_ref().map(|c| c.declarer);
         let complete = f.phase == Phase::Complete;
 
         let mut hands = serde_json::Map::new();
@@ -285,7 +292,8 @@ impl TableState {
             let visible = complete
                 || see_all
                 || viewer_seat == Some(seat)
-                || (f.opening_lead_made && dummy == Some(seat));
+                || (f.opening_lead_made && dummy == Some(seat))
+                || (f.opening_lead_made && viewer_seat == dummy && declarer == Some(seat));
             let entry = if visible {
                 json!({
                     "visible": true,

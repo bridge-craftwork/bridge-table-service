@@ -143,7 +143,12 @@ async fn bot_turn_pending(room: &Room) -> bool {
 /// asked about the seat on turn, so the on-turn grace period applies.
 fn is_bot_seat(inner: &crate::rooms::RoomInner, f: &crate::table::Folded, seat: Direction) -> bool {
     let controller = match &f.contract {
-        Some(c) if seat == c.dummy() => c.declarer,
+        // Declarer-side seats resolve through the controller chain: human
+        // declarer plays both; else a human dummy plays the hand for a bot
+        // declarer; else the bot drives.
+        Some(c) if seat == c.dummy() || seat == c.declarer => {
+            inner.declarer_side_controller(c.declarer, true, Instant::now())
+        }
         _ => seat,
     };
     inner.seat_bot_controlled(controller, true, Instant::now())
