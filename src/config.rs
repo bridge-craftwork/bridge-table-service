@@ -16,6 +16,12 @@ pub struct Config {
     /// and early plays routinely need >8s even on a warm BEN; the
     /// RandomLegal fallback still catches anything slower than this.
     pub bot_timeout_ms: u64,
+    /// bridge-dealer-service (dealer3 wrapper) for script-generated deals.
+    /// On the droplet: internal `http://bridge-dealer-service:8001`.
+    pub dealer_url: String,
+    /// Bearer token for the dealer service. Absent → the "script" deal
+    /// source politely reports itself unavailable.
+    pub dealer_token: Option<String>,
 }
 
 impl Config {
@@ -33,6 +39,8 @@ impl Config {
             bot_timeout_ms: env_or("BOT_TIMEOUT_MS", "20000")
                 .parse()
                 .context("BOT_TIMEOUT_MS")?,
+            dealer_url: env_or("DEALER_URL", "http://bridge-dealer-service:8001"),
+            dealer_token: std::env::var("DEALER_TOKEN").ok().filter(|s| !s.is_empty()),
         })
     }
 }

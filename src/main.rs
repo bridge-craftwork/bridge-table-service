@@ -9,6 +9,7 @@ mod auth;
 mod bots;
 mod config;
 mod db;
+mod dealer;
 mod engine;
 mod observability;
 mod rooms;
@@ -38,6 +39,7 @@ async fn main() -> Result<()> {
         &cfg.bba_url,
         std::time::Duration::from_millis(cfg.bot_timeout_ms),
     );
+    dealer::init(&cfg.dealer_url, cfg.dealer_token.clone());
 
     let db = db::open(&cfg.database_path).await?;
 

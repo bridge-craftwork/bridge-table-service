@@ -961,6 +961,28 @@ async fn handle_client_msg(
                 ));
             }
             let source = v["source"].as_str().unwrap_or("");
+            // Script deals hit the dealer service over HTTP — resolve them
+            // to PBN BEFORE taking the state lock.
+            let script_pbn = if source == "script" {
+                let Some(script) = v["script"].as_str() else {
+                    return Some(err_msg("bad_script", "deal.script missing"));
+                };
+                if !crate::dealer::available() {
+                    return Some(err_msg(
+                        "dealer_unavailable",
+                        "script deals aren't set up on this server yet",
+                    ));
+                }
+                match crate::dealer::generate_board_pbn(script).await {
+                    Ok(pbn) => Some(pbn),
+                    Err(e) => {
+                        tracing::warn!(event = "dealer_failed", error = %format!("{e:#}"), "");
+                        return Some(err_msg("dealer_failed", &format!("{e:#}")));
+                    }
+                }
+            } else {
+                None
+            };
             let ev = {
                 let mut inner = room.state.lock().await;
                 match source {
@@ -989,10 +1011,20 @@ async fn handle_client_msg(
                             Err(e) => return Some(err_msg("bad_pbn", &e)),
                         }
                     }
+                    // Dealer-script deals: the PBN was generated above.
+                    "script" => {
+                        let pbn = script_pbn.as_deref().unwrap_or("");
+                        let rotate = (v["rotate"].as_u64().unwrap_or(0) % 4) as u8;
+                        let number = inner.table.board.number + 1;
+                        match crate::rooms::board_from_pbn(pbn, rotate, number) {
+                            Ok(board) => inner.table = crate::table::TableState::new(board),
+                            Err(e) => return Some(err_msg("bad_pbn", &e)),
+                        }
+                    }
                     _ => {
                         return Some(err_msg(
                             "bad_source",
-                            "source must be random, replay, or pbn",
+                            "source must be random, replay, pbn, or script",
                         ))
                     }
                 }
