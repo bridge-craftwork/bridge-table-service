@@ -51,6 +51,10 @@ pub enum BotMode {
     /// BBA bidding + instant rule-based cardplay (bridge-rulebot) — watch
     /// the rulebot defend real contracts without BEN in the loop.
     Rules = 2,
+    /// Rules mode with human-mimicking pacing: N/S play each card after a
+    /// random 3-10s think, E/W stay fast. For teacher-console testing —
+    /// boards last long enough to observe and interact (Rick 2026-07-02).
+    Slow = 3,
 }
 
 impl BotMode {
@@ -58,6 +62,7 @@ impl BotMode {
         match s {
             "random" => Some(BotMode::Random),
             "rules" => Some(BotMode::Rules),
+            "slow" => Some(BotMode::Slow),
             _ => None,
         }
     }
@@ -66,6 +71,7 @@ impl BotMode {
         match v {
             1 => BotMode::Random,
             2 => BotMode::Rules,
+            3 => BotMode::Slow,
             _ => BotMode::Real,
         }
     }
@@ -76,6 +82,7 @@ impl BotMode {
             BotMode::Real => "real",
             BotMode::Random => "random",
             BotMode::Rules => "rules",
+            BotMode::Slow => "slow",
         }
     }
 }

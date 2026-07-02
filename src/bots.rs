@@ -275,10 +275,12 @@ async fn act_once(room: &Room) -> bool {
             calls,
         } => {
             let (call, via) = match mode {
-                // Rules mode still bids with BBA — the rulebot is cardplay
-                // only, and all-pass auctions made the mode useless for
-                // watching the bot defend real contracts (Rick, 2026-07-02).
-                BotMode::Real | BotMode::Rules => choose_call(room, &board, &calls).await,
+                // Rules/Slow modes still bid with BBA — the rulebot is
+                // cardplay only, and all-pass auctions made the mode useless
+                // for watching real contracts (Rick, 2026-07-02).
+                BotMode::Real | BotMode::Rules | BotMode::Slow => {
+                    choose_call(room, &board, &calls).await
+                }
                 BotMode::Random => (Call::Pass, "random"),
             };
             (seq, Action::Call { seat, call }, via, false)
@@ -288,6 +290,18 @@ async fn act_once(room: &Room) -> bool {
                 BotMode::Real => choose_card(&p).await,
                 BotMode::Random => (pick(&p.legal, p.seq), "random"),
                 BotMode::Rules => (rules_card(&p), "rules"),
+                // Slow mode mimics humans at N/S: rulebot card, then a
+                // random 3-10s think before it lands. E/W stay fast. The
+                // state lock is NOT held during the sleep and the seq guard
+                // below discards the play if a human acted meanwhile.
+                BotMode::Slow => {
+                    let card = rules_card(&p);
+                    if matches!(p.seat, Direction::North | Direction::South) {
+                        let think_ms = 3000 + (rand::random::<u64>() % 7000);
+                        tokio::time::sleep(Duration::from_millis(think_ms)).await;
+                    }
+                    (card, "rules")
+                }
             };
             (
                 p.seq,
