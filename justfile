@@ -63,7 +63,7 @@ release VERSION:
 #   - add a [patch] entry in Cargo.toml,
 #   - add a COPY line in the Dockerfile,
 #   - add a checkout step + build-contexts entry in .github/workflows/ci.yml.
-SIBLING_CONTEXTS := "--build-context bridge-types=../bridge-types --build-context bridge-encodings=../bridge-encodings"
+SIBLING_CONTEXTS := "--build-context bridge-types=../bridge-types --build-context bridge-encodings=../bridge-encodings --build-context bridge-rulebot=../bridge-rulebot"
 
 # Ensure colima is running (no-op if already up).
 _colima-up:

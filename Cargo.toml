@@ -33,6 +33,7 @@ base64 = "0.22"
 
 bridge-types = { git = "https://github.com/bridge-craftwork/bridge-types" }
 bridge-encodings = { git = "https://github.com/bridge-craftwork/bridge-encodings" }
+bridge-rulebot = { git = "https://github.com/bridge-craftwork/bridge-rulebot" }
 
 # Sibling repos as sister directories (developer Mac and Docker build share
 # this layout — see README "Sibling crate path-deps").
@@ -41,6 +42,9 @@ bridge-types = { path = "../bridge-types" }
 
 [patch."https://github.com/bridge-craftwork/bridge-encodings"]
 bridge-encodings = { path = "../bridge-encodings" }
+
+[patch."https://github.com/bridge-craftwork/bridge-rulebot"]
+bridge-rulebot = { path = "../bridge-rulebot" }
 
 [profile.release]
 strip = true

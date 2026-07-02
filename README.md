@@ -10,7 +10,7 @@ Hosts live bridge tables for [Bridge Classroom](https://bridge-classroom.com): t
 
 - **Event-sourced tables**: each table's state is a fold over its action log; undo (unlimited, Shark-style) is truncate-and-refold.
 - **Join tickets**: clients authenticate the WebSocket with a short-lived HMAC ticket minted by the bridge-classroom API (`TICKET_SECRET` shared between the two services); this service verifies offline.
-- **Sister crates**: bridge primitives come from [`bridge-types`](https://github.com/bridge-craftwork/bridge-types) and PBN parsing from [`bridge-encodings`](https://github.com/bridge-craftwork/bridge-encodings) — only auction/play *legality* logic lives here (see `src/engine/`).
+- **Sister crates**: bridge primitives come from [`bridge-types`](https://github.com/bridge-craftwork/bridge-types), PBN parsing from [`bridge-encodings`](https://github.com/bridge-craftwork/bridge-encodings), and rule-based cardplay from [`bridge-rulebot`](https://github.com/bridge-craftwork/bridge-rulebot) — only auction/play *legality* logic lives here (see `src/engine/`).
 
 ## Local development
 
@@ -22,7 +22,7 @@ just dev                          # cargo run, listens on localhost:8004
 cargo test
 ```
 
-Sibling crates are expected as sister directories (`../bridge-types`, `../bridge-encodings`) via the `[patch]` entries in `Cargo.toml` — see "Sibling crate path-deps" below.
+Sibling crates are expected as sister directories (`../bridge-types`, `../bridge-encodings`, `../bridge-rulebot`) via the `[patch]` entries in `Cargo.toml` — see "Sibling crate path-deps" below.
 
 > **About the `justfile`:** it's organized into three audience-scoped sections. *Universal* recipes (`dev`, `test`, `check`, `release`) work on any platform. *Apple Silicon Mac* recipes (`build`, `push`) drive a Colima/Rosetta cross-build pipeline for the maintainer's amd64 droplet. *Maintainer droplet* recipes (`deploy`, `logs`, `shell`, …) ssh to a local SSH alias (`bridge-droplet`) defined in the maintainer's personal `~/.ssh/config`. If you're forking this service, you can ignore sections 2 and 3 — `docker build .` works directly, [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is platform-agnostic and produces images on GitHub's amd64 runners.
 
@@ -74,9 +74,11 @@ colima stop && colima start --vz-rosetta   # one-time; persists across reboots
 
 Bot seats use BBA for bidding (with a per-room predicted-auction prefix cache; divergence or undo re-requests with `auctionPrefix`) and BEN for cardplay (encodings mirror the frontend's `benClient.js`). Every suggestion is validated through the legality engine; on timeout (`BOT_TIMEOUT_MS` for BEN, 8s for BBA), error, or an illegal suggestion the seat falls back to Pass / a random legal card, so a slow bot never freezes a table. BEN is pre-warmed at startup to absorb its ~20s model cold start. For testing, a client can send `"bot":"random"` in its `hello` frame to switch the whole room to instant RandomLegal bots (Pass for bidding, deterministic legal card for play — no BBA/BEN calls); the `welcome` frame reports the active mode as `"bot_mode":"real"|"random"`.
 
+[`bridge-rulebot`](https://github.com/bridge-craftwork/bridge-rulebot) (sibling crate, dependency already wired) is the planned replacement for the random cardplay fallback: a deterministic rule-based player with teachable reason codes that also covers BEN's cold-start window. Integration into `src/bots.rs` follows once its V1 rules land — see that repo's `docs/requirements.md`.
+
 ## Sibling crate path-deps
 
-This service depends on `bridge-types` and `bridge-encodings` as sibling repos via the buildx multi-context pattern. The container layout mirrors the developer-Mac layout — siblings live as sister directories of the service — so a single `[patch]` path works in both native cargo and inside Docker.
+This service depends on `bridge-types`, `bridge-encodings`, and `bridge-rulebot` as sibling repos via the buildx multi-context pattern. The container layout mirrors the developer-Mac layout — siblings live as sister directories of the service — so a single `[patch]` path works in both native cargo and inside Docker.
 
 The wiring lives in four places (already done for both siblings): `Cargo.toml` (`[patch]` entries), `justfile` (`SIBLING_CONTEXTS`), `Dockerfile` (`COPY --from=` lines), and `.github/workflows/ci.yml` (checkout steps in both jobs + `build-contexts:`).
 

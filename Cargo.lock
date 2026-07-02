@@ -161,6 +161,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-rulebot"
+version = "0.1.0"
+dependencies = [
+ "bridge-types",
+ "web-time",
+]
+
+[[package]]
 name = "bridge-table-service"
 version = "0.1.0"
 dependencies = [
@@ -168,6 +176,7 @@ dependencies = [
  "axum",
  "base64",
  "bridge-encodings",
+ "bridge-rulebot",
  "bridge-types",
  "chrono",
  "futures-util",

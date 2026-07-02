@@ -11,6 +11,7 @@ WORKDIR /workspace
 # works for native cargo and for this build).
 COPY --from=bridge-types . ./bridge-types/
 COPY --from=bridge-encodings . ./bridge-encodings/
+COPY --from=bridge-rulebot . ./bridge-rulebot/
 
 # Cache deps separately from source. Service goes in a bridge-table-service
 # subdirectory so siblings can reference its parent (../<sibling>).

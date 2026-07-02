@@ -35,6 +35,11 @@ jobs:
         with:
           repository: bridge-craftwork/bridge-encodings
           path: bridge-encodings
+      - name: Checkout bridge-rulebot
+        uses: actions/checkout@v4
+        with:
+          repository: bridge-craftwork/bridge-rulebot
+          path: bridge-rulebot
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -73,6 +78,11 @@ jobs:
         with:
           repository: bridge-craftwork/bridge-encodings
           path: bridge-encodings
+      - name: Checkout bridge-rulebot
+        uses: actions/checkout@v4
+        with:
+          repository: bridge-craftwork/bridge-rulebot
+          path: bridge-rulebot
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -100,6 +110,7 @@ jobs:
           build-contexts: |
             bridge-types=bridge-types
             bridge-encodings=bridge-encodings
+            bridge-rulebot=bridge-rulebot
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
