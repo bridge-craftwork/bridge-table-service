@@ -1,0 +1,11 @@
+target
+data
+.env
+.git
+.github
+.gitignore
+.dockerignore
+README.md
+justfile
+docker-compose.yml
+.DS_Store
