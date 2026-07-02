@@ -58,6 +58,10 @@ pub struct Room {
     /// bots::ensure_keepalive) — it periodically re-kicks the driver so a
     /// disconnected seat's bot takeover happens without another human action.
     pub keepalive_running: std::sync::atomic::AtomicBool,
+    /// Testing convenience: when set (via `"bot":"random"` in a hello), the
+    /// bot driver uses RandomLegal for both bidding (Pass) and play,
+    /// skipping BBA/BEN entirely. Sticky for the room's lifetime.
+    pub random_bots: std::sync::atomic::AtomicBool,
     /// BBA's predicted auction for the current board (complete, from call
     /// 1). Bot calls are served from it while the actual auction remains a
     /// prefix; divergence or undo re-requests (see bots/bba.rs). Separate
@@ -82,6 +86,7 @@ impl Room {
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
             keepalive_running: std::sync::atomic::AtomicBool::new(false),
+            random_bots: std::sync::atomic::AtomicBool::new(false),
             bba_cache: Mutex::new(None),
         })
     }

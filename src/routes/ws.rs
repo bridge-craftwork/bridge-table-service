@@ -3,7 +3,9 @@
 //! Protocol (JSON, one message per frame):
 //!   client → server: {"t":"hello","ticket":"…"} must be the FIRST message
 //!                    (the ticket travels in-band, not in the URL, so it
-//!                    stays out of proxy logs), then
+//!                    stays out of proxy logs; optional "bot":"random"
+//!                    switches the room to RandomLegal bots for testing —
+//!                    the welcome echoes "bot_mode":"real"|"random"), then
 //!                    {"t":"bid","call":"1H"} | {"t":"play","card":"SA"} |
 //!                    {"t":"undo","to_seq":N} | {"t":"pong"}
 //!   server → client: {"t":"welcome"…} then {"t":"snapshot"…} on join,
@@ -76,13 +78,27 @@ fn snapshot_msg(
 
 async fn handle(mut socket: WebSocket, state: SharedState) {
     // First frame must be hello{ticket}.
-    let ticket = match wait_for_hello(&mut socket, &state).await {
-        Some(t) => t,
+    let hello = match wait_for_hello(&mut socket, &state).await {
+        Some(h) => h,
         None => return, // error already sent / socket gone
     };
+    let ticket = hello.ticket;
 
     // Until session routing lands, every connection joins the demo room.
     let room = state.rooms.demo_room().await;
+
+    // Testing convenience: hello{"bot":"random"} flips the whole room to
+    // RandomLegal bots (sticky; absent field leaves the mode untouched).
+    if hello.random_bots {
+        room.random_bots
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(event = "bot_mode_random", room = %room.id, sub = %ticket.sub, "");
+    }
+    let bot_mode = if room.random_bots.load(std::sync::atomic::Ordering::Relaxed) {
+        "random"
+    } else {
+        "real"
+    };
 
     let (seat, welcome, snapshot, seats_event) = {
         let mut inner = room.state.lock().await;
@@ -94,6 +110,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
             "name": ticket.name,
             "role": ticket.role,
             "seat": seat.map(|s| s.to_char().to_string()),
+            "bot_mode": bot_mode,
         })
         .to_string();
         let snapshot = snapshot_msg(&room.id, &inner, seat, see_all);
@@ -198,7 +215,15 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
     tracing::info!(event = "ws_left", sub = %ticket.sub, room = %room.id, "");
 }
 
-async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<Ticket> {
+/// The parsed hello frame: the verified ticket plus protocol options.
+struct Hello {
+    ticket: Ticket,
+    /// True iff the hello carried `"bot":"random"` (testing convenience:
+    /// switches the room's bot driver to RandomLegal, skipping BBA/BEN).
+    random_bots: bool,
+}
+
+async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<Hello> {
     let msg = socket.recv().await?.ok()?;
     let Message::Text(text) = msg else {
         let _ = socket
@@ -234,7 +259,10 @@ async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<T
         return None;
     };
     match verify_ticket(token, &state.ticket_secret) {
-        Ok(t) => Some(t),
+        Ok(ticket) => Some(Hello {
+            ticket,
+            random_bots: v["bot"].as_str() == Some("random"),
+        }),
         Err(e) => {
             let _ = socket
                 .send(Message::Text(err_msg("bad_ticket", &e.to_string())))

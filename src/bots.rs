@@ -244,6 +244,9 @@ async fn act_once(room: &Room) -> bool {
 
     // Phase B: choose. May take seconds (BBA/BEN over HTTP); the state
     // lock is not held, so humans keep acting and undo keeps working.
+    // In random mode (testing) the choice is instant: the RandomLegal
+    // fallback is used directly and BBA/BEN are never called.
+    let random_mode = room.random_bots.load(Ordering::Relaxed);
     let (seq, action, via, opening_lead) = match pending {
         Pending::Bid {
             seat,
@@ -251,11 +254,19 @@ async fn act_once(room: &Room) -> bool {
             board,
             calls,
         } => {
-            let (call, via) = choose_call(room, &board, &calls).await;
+            let (call, via) = if random_mode {
+                (Call::Pass, "random")
+            } else {
+                choose_call(room, &board, &calls).await
+            };
             (seq, Action::Call { seat, call }, via, false)
         }
         Pending::Play(p) => {
-            let (card, via) = choose_card(&p).await;
+            let (card, via) = if random_mode {
+                (pick(&p.legal, p.seq), "random")
+            } else {
+                choose_card(&p).await
+            };
             (
                 p.seq,
                 Action::Play { seat: p.seat, card },
