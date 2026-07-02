@@ -30,7 +30,7 @@ use once_cell::sync::OnceCell;
 use serde_json::json;
 
 use crate::engine::auction;
-use crate::rooms::Room;
+use crate::rooms::{BotMode, Room};
 use crate::table::{Action, BoardSetup, Phase};
 
 /// Pacing, matching the solo client's feel (useCardPlay.js): a beat between
@@ -178,6 +178,17 @@ struct PlayPending {
     vul: Vulnerability,
     ctx: String,
     played: String,
+    // Rulebot inputs (bridge-rulebot is stateless: full history per call).
+    /// The acting seat's remaining cards (superset of `legal`).
+    remaining: Vec<Card>,
+    /// Dummy's ORIGINAL 13 cards.
+    dummy_cards: Vec<Card>,
+    /// The auction, in call order from the dealer.
+    calls: Vec<Call>,
+    /// Chronological play history, all seats.
+    played_pairs: Vec<(Direction, Card)>,
+    /// PBN contract string, e.g. "4S", "3N", "2HX".
+    contract_pbn: String,
 }
 
 /// Make one bot action if it's a bot's turn. Returns false when it isn't
@@ -236,6 +247,11 @@ async fn act_once(room: &Room) -> bool {
                     vul: board.vulnerable,
                     ctx: ben::calls_to_ctx(&f.calls),
                     played: ben::played_to_string(&f.played),
+                    remaining,
+                    dummy_cards: board.deal.hand(c.dummy()).cards().to_vec(),
+                    calls: f.calls.clone(),
+                    played_pairs: f.played.clone(),
+                    contract_pbn: c.to_pbn(),
                 }))
             }
             Phase::Complete => return false,
@@ -244,9 +260,8 @@ async fn act_once(room: &Room) -> bool {
 
     // Phase B: choose. May take seconds (BBA/BEN over HTTP); the state
     // lock is not held, so humans keep acting and undo keeps working.
-    // In random mode (testing) the choice is instant: the RandomLegal
-    // fallback is used directly and BBA/BEN are never called.
-    let random_mode = room.random_bots.load(Ordering::Relaxed);
+    // Random and Rules modes are instant and never call BBA/BEN.
+    let mode = room.bot_mode();
     let (seq, action, via, opening_lead) = match pending {
         Pending::Bid {
             seat,
@@ -254,18 +269,18 @@ async fn act_once(room: &Room) -> bool {
             board,
             calls,
         } => {
-            let (call, via) = if random_mode {
-                (Call::Pass, "random")
-            } else {
-                choose_call(room, &board, &calls).await
+            let (call, via) = match mode {
+                BotMode::Real => choose_call(room, &board, &calls).await,
+                BotMode::Random => (Call::Pass, "random"),
+                BotMode::Rules => (Call::Pass, "rules"),
             };
             (seq, Action::Call { seat, call }, via, false)
         }
         Pending::Play(p) => {
-            let (card, via) = if random_mode {
-                (pick(&p.legal, p.seq), "random")
-            } else {
-                choose_card(&p).await
+            let (card, via) = match mode {
+                BotMode::Real => choose_card(&p).await,
+                BotMode::Random => (pick(&p.legal, p.seq), "random"),
+                BotMode::Rules => (rules_card(&p), "rules"),
             };
             (
                 p.seq,
@@ -457,17 +472,129 @@ async fn choose_card(p: &PlayPending) -> (Card, &'static str) {
             Err(e) => {
                 // {:#} shows the anyhow cause chain (e.g. "operation timed
                 // out"), which is what distinguishes a slow BEN from a down one.
-                tracing::warn!(event = "ben_failed", error = %format!("{e:#}"), "falling back to RandomLegal")
+                tracing::warn!(event = "ben_failed", error = %format!("{e:#}"), "falling back to rulebot")
             }
         }
     }
-    (pick(&p.legal, p.seq), "random")
+    (rules_card(p), "rules")
+}
+
+/// Rule-based card via bridge-rulebot: deterministic, sub-millisecond,
+/// with a teachable reason for every pick. Serves as the Rules bot mode
+/// and as the cardplay fallback while BEN is cold/slow/wrong. The rulebot
+/// is stateless — the full play history goes in on every call — and only
+/// ever returns a member of `legal`, so no re-validation is needed (the
+/// deterministic pick guards the impossible error path anyway).
+fn rules_card(p: &PlayPending) -> Card {
+    let config = bridge_rulebot::SignalConfig::default();
+    let decision = if p.opening_lead {
+        bridge_rulebot::choose_opening_lead(
+            &bridge_rulebot::LeadContext {
+                seat: p.seat,
+                hand: p.remaining.clone(),
+                declarer: p.declarer,
+                dealer: p.dealer,
+                contract: p.contract_pbn.clone(),
+                auction: p.calls.clone(),
+                vulnerability: p.vul,
+                legal: p.legal.clone(),
+            },
+            &config,
+        )
+    } else {
+        bridge_rulebot::choose_card(
+            &bridge_rulebot::PlayContext {
+                seat: p.seat,
+                hand: p.remaining.clone(),
+                dummy: p.dummy_cards.clone(),
+                declarer: p.declarer,
+                dealer: p.dealer,
+                contract: p.contract_pbn.clone(),
+                auction: p.calls.clone(),
+                vulnerability: p.vul,
+                played: p
+                    .played_pairs
+                    .iter()
+                    .map(|(seat, card)| bridge_rulebot::PlayedCard {
+                        seat: *seat,
+                        card: *card,
+                    })
+                    .collect(),
+                legal: p.legal.clone(),
+            },
+            &config,
+        )
+    };
+    match decision {
+        Ok(d) => {
+            tracing::debug!(
+                event = "rulebot_decision",
+                rule = d.rule,
+                legal_count = d.legal_count,
+                micros = d.duration_micros,
+                explanation = %d.explanation,
+                ""
+            );
+            d.card
+        }
+        Err(e) => {
+            // Only reachable with an empty legal set, which act_once
+            // already screens out.
+            tracing::error!(event = "rulebot_failed", error = %e, "");
+            pick(&p.legal, p.seq)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bridge_types::Direction::*;
+    use bridge_types::{Rank, Suit};
+
+    /// The rulebot path returns a legal card deterministically, and its
+    /// choice is a *reasoned* one: third hand (partner led a low spade,
+    /// dummy played low) goes up with the king, which no random pick can
+    /// be trusted to do. Exercises the full PlayPending → PlayContext
+    /// translation including the played-history mapping.
+    #[test]
+    fn rules_card_plays_third_hand_high() {
+        let c = |s: Suit, r: Rank| Card::new(s, r);
+        let legal = vec![
+            c(Suit::Spades, Rank::King),
+            c(Suit::Spades, Rank::Eight),
+            c(Suit::Spades, Rank::Two),
+        ];
+        let p = PlayPending {
+            seat: East,
+            seq: 7,
+            legal: legal.clone(),
+            opening_lead: false,
+            decision_maker: East,
+            declarer: South,
+            hand_pbn: String::new(),
+            dummy_pbn: String::new(),
+            dealer: North,
+            vul: Vulnerability::None,
+            ctx: String::new(),
+            played: String::new(),
+            remaining: legal,
+            dummy_cards: vec![
+                c(Suit::Spades, Rank::Seven),
+                c(Suit::Spades, Rank::Four),
+                c(Suit::Spades, Rank::Three),
+            ],
+            calls: vec![],
+            played_pairs: vec![
+                (West, c(Suit::Spades, Rank::Five)),
+                (North, c(Suit::Spades, Rank::Three)),
+            ],
+            contract_pbn: "3N".to_string(),
+        };
+        let first = rules_card(&p);
+        assert_eq!(first, c(Suit::Spades, Rank::King), "third hand high");
+        assert_eq!(rules_card(&p), first, "deterministic");
+    }
 
     /// Zombie-seat takeover through the driver's own gate: a fully human
     /// table has no pending bot turn until the seat on turn has been

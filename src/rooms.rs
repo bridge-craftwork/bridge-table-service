@@ -36,6 +36,50 @@ pub const TAKEOVER_AFTER_ON_TURN: Duration = Duration::from_secs(20);
 /// up for everyone).
 pub const RESYNC: &str = "__resync__";
 
+/// Which backend drives the room's bot seats. Real is the default; the
+/// others are set via `"bot":"random"` / `"bot":"rules"` in a hello frame
+/// and are sticky for the room's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum BotMode {
+    /// BBA bidding + BEN cardplay, with bridge-rulebot as the cardplay
+    /// fallback (Pass for bidding).
+    #[default]
+    Real = 0,
+    /// Instant deterministic RandomLegal cardplay, Pass bidding. Testing.
+    Random = 1,
+    /// Instant rule-based cardplay (bridge-rulebot), Pass bidding — watch
+    /// the rulebot play without BBA/BEN in the loop.
+    Rules = 2,
+}
+
+impl BotMode {
+    pub fn parse(s: &str) -> Option<BotMode> {
+        match s {
+            "random" => Some(BotMode::Random),
+            "rules" => Some(BotMode::Rules),
+            _ => None,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> BotMode {
+        match v {
+            1 => BotMode::Random,
+            2 => BotMode::Rules,
+            _ => BotMode::Real,
+        }
+    }
+
+    /// Wire name, echoed in the welcome frame's `bot_mode`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BotMode::Real => "real",
+            BotMode::Random => "random",
+            BotMode::Rules => "rules",
+        }
+    }
+}
+
 /// A seated (or recently seated) occupant.
 #[derive(Debug, Clone)]
 pub struct Occupant {
@@ -59,10 +103,9 @@ pub struct Room {
     /// bots::ensure_keepalive) — it periodically re-kicks the driver so a
     /// disconnected seat's bot takeover happens without another human action.
     pub keepalive_running: std::sync::atomic::AtomicBool,
-    /// Testing convenience: when set (via `"bot":"random"` in a hello), the
-    /// bot driver uses RandomLegal for both bidding (Pass) and play,
-    /// skipping BBA/BEN entirely. Sticky for the room's lifetime.
-    pub random_bots: std::sync::atomic::AtomicBool,
+    /// Bot backend for this room, stored as `BotMode as u8` (see `BotMode`;
+    /// read via `Room::bot_mode()`).
+    pub bot_mode_raw: std::sync::atomic::AtomicU8,
     /// BBA's predicted auction for the current board (complete, from call
     /// 1). Bot calls are served from it while the actual auction remains a
     /// prefix; divergence or undo re-requests (see bots/bba.rs). Separate
@@ -99,7 +142,7 @@ impl Room {
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
             keepalive_running: std::sync::atomic::AtomicBool::new(false),
-            random_bots: std::sync::atomic::AtomicBool::new(false),
+            bot_mode_raw: std::sync::atomic::AtomicU8::new(BotMode::Real as u8),
             bba_cache: Mutex::new(None),
             session,
         })
@@ -108,6 +151,17 @@ impl Room {
     /// The owning session, if this room belongs to one (and it's alive).
     pub fn session(&self) -> Option<Arc<Session>> {
         self.session.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// The room's current bot backend.
+    pub fn bot_mode(&self) -> BotMode {
+        BotMode::from_u8(self.bot_mode_raw.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Switch the room's bot backend (sticky; see `BotMode`).
+    pub fn set_bot_mode(&self, mode: BotMode) {
+        self.bot_mode_raw
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Push a lobby refresh to the session's teacher connections (no-op for
