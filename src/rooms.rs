@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bridge_types::Direction;
+use bridge_types::{Call, Direction};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::table::{BoardSetup, TableState};
@@ -34,6 +34,11 @@ pub struct Room {
     pub events: broadcast::Sender<String>,
     /// True while a bot-driver task is live for this room (see bots::kick).
     pub bot_running: std::sync::atomic::AtomicBool,
+    /// BBA's predicted auction for the current board (complete, from call
+    /// 1). Bot calls are served from it while the actual auction remains a
+    /// prefix; divergence or undo re-requests (see bots/bba.rs). Separate
+    /// from `state` so an in-flight BBA request never blocks humans.
+    pub bba_cache: Mutex<Option<Vec<Call>>>,
 }
 
 pub struct RoomInner {
@@ -52,6 +57,7 @@ impl Room {
             }),
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
+            bba_cache: Mutex::new(None),
         })
     }
 

@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
 
     observability::logging::init(&cfg.log_level, &cfg.log_format);
     observability::metrics::init();
+    bots::init(&cfg.ben_url, &cfg.bba_url);
 
     let db = db::open(&cfg.database_path).await?;
 

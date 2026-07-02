@@ -7,6 +7,11 @@ pub struct Config {
     pub database_path: String,
     pub dashboard_secret: String,
     pub ticket_secret: String,
+    /// BEN cardplay engine. On the droplet set `BEN_URL=http://ben:8085`
+    /// (same bridge-net docker network) instead of the public hostname.
+    pub ben_url: String,
+    /// BBA bidding engine (Windows-VM-hosted, public URL only).
+    pub bba_url: String,
 }
 
 impl Config {
@@ -19,6 +24,8 @@ impl Config {
             dashboard_secret: std::env::var("DASHBOARD_SECRET")
                 .context("DASHBOARD_SECRET is required")?,
             ticket_secret: std::env::var("TICKET_SECRET").context("TICKET_SECRET is required")?,
+            ben_url: env_or("BEN_URL", "https://ben.bridge-craftwork.com"),
+            bba_url: env_or("BBA_URL", "https://bba.harmonicsystems.com"),
         })
     }
 }
