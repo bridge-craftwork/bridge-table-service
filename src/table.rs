@@ -230,6 +230,38 @@ impl TableState {
         }
     }
 
+    /// The board-result payload, once the board is complete (played out or
+    /// passed out). None while in progress. Broadcast at board completion
+    /// as the `board_complete` event body — results are NOT persisted in
+    /// v1, this live broadcast is the whole delivery.
+    pub fn board_result_json(&self) -> Option<Value> {
+        let f = self.fold();
+        if f.phase != Phase::Complete {
+            return None;
+        }
+        let contract = f.contract.as_ref().map(|c| {
+            let declarer_tricks = if matches!(c.declarer, Direction::North | Direction::South) {
+                f.tricks_ns
+            } else {
+                f.tricks_ew
+            };
+            let made = declarer_tricks as i16 - (c.level as i16 + 6);
+            json!({
+                "text": c.to_pbn(),
+                "declarer": c.declarer.to_char().to_string(),
+                "declarer_tricks": declarer_tricks,
+                // Relative result: 0 = made exactly, +N overtricks, -N down.
+                "made": made,
+            })
+        });
+        Some(json!({
+            "board_no": self.board.number,
+            "passed_out": f.contract.is_none(),
+            "contract": contract,
+            "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
+        }))
+    }
+
     /// Redacted JSON snapshot for one viewer. `viewer_seat` is the seat the
     /// viewer occupies (None for kibitzers). `see_all` is teacher/demo mode.
     ///

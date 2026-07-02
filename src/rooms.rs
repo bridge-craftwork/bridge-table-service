@@ -10,13 +10,14 @@
 //! State is deliberately in-memory only — v1 table sessions are ephemeral
 //! (no persistence), per the project plan.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bridge_types::{Call, Direction};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
+use crate::sessions::Session;
 use crate::table::{BoardSetup, TableState};
 
 /// Zombie-seat policy: how long a disconnected occupant keeps their seat
@@ -67,28 +68,55 @@ pub struct Room {
     /// prefix; divergence or undo re-requests (see bots/bba.rs). Separate
     /// from `state` so an in-flight BBA request never blocks humans.
     pub bba_cache: Mutex<Option<Vec<Call>>>,
+    /// Back-reference to the owning session (None for the demo room). Weak
+    /// so removing a session from the registry actually frees it; used to
+    /// push lobby refreshes to the teacher after any table change.
+    pub session: Option<Weak<Session>>,
 }
 
 pub struct RoomInner {
     pub table: TableState,
     pub seats: HashMap<Direction, Occupant>,
+    /// Index into the owning session's board list (always 0 for the demo
+    /// room). The session's `try_advance` moves it forward.
+    pub board_index: usize,
+    /// Seats that sent `ready_next_board` for the current board. Cleared on
+    /// advance and when a seat's occupant changes.
+    pub ready: HashSet<Direction>,
 }
 
 impl Room {
-    pub fn new(id: String, board: BoardSetup) -> Arc<Self> {
+    pub fn new(id: String, board: BoardSetup, session: Option<Weak<Session>>) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         Arc::new(Self {
             id,
             state: Mutex::new(RoomInner {
                 table: TableState::new(board),
                 seats: HashMap::new(),
+                board_index: 0,
+                ready: HashSet::new(),
             }),
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
             keepalive_running: std::sync::atomic::AtomicBool::new(false),
             random_bots: std::sync::atomic::AtomicBool::new(false),
             bba_cache: Mutex::new(None),
+            session,
         })
+    }
+
+    /// The owning session, if this room belongs to one (and it's alive).
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.session.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Push a lobby refresh to the session's teacher connections (no-op for
+    /// the demo room). Cheap; called after any state change worth showing
+    /// on the teacher grid.
+    pub fn notify_session_lobby(&self) {
+        if let Some(s) = self.session() {
+            s.notify_lobby();
+        }
     }
 
     /// Broadcast a serialized event to everyone in the room. Errors (no
@@ -105,7 +133,7 @@ impl Room {
     /// A room on the demo board, for unit tests in other modules.
     #[cfg(test)]
     pub fn new_for_test(id: &str) -> Arc<Self> {
-        Self::new(id.to_string(), demo_board())
+        Self::new(id.to_string(), demo_board(), None)
     }
 }
 
@@ -134,6 +162,40 @@ impl RoomInner {
             }
         }
         None // table full → kibitzer
+    }
+
+    /// Seat `sub` at `seat` iff it's vacant. Used by the seat policies and
+    /// the teacher's assign_seat (which vacates first).
+    pub fn try_seat(&mut self, seat: Direction, sub: &str, name: &str) -> bool {
+        self.try_place(
+            seat,
+            Occupant {
+                sub: sub.to_string(),
+                name: name.to_string(),
+                connected: true,
+                disconnected_at: None,
+            },
+        )
+    }
+
+    /// Place a pre-built occupant (preserves connected/disconnected state
+    /// when the teacher moves someone between seats) iff the seat is
+    /// vacant. A newly placed occupant is never "ready".
+    pub fn try_place(&mut self, seat: Direction, occ: Occupant) -> bool {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.seats.entry(seat) {
+            e.insert(occ);
+            self.ready.remove(&seat);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Vacate a seat (teacher boot / assign away). Returns the removed
+    /// occupant. Also clears the seat's ready flag.
+    pub fn vacate(&mut self, seat: Direction) -> Option<Occupant> {
+        self.ready.remove(&seat);
+        self.seats.remove(&seat)
     }
 
     pub fn mark_disconnected(&mut self, sub: &str) {
@@ -186,12 +248,17 @@ impl RoomInner {
 
 pub struct Registry {
     rooms: RwLock<HashMap<String, Arc<Room>>>,
+    /// Live sessions by id (hello tickets route on `session_id`). Session
+    /// rooms live inside their session, not in `rooms` (which now only
+    /// holds the dev demo room).
+    sessions: RwLock<HashMap<String, Arc<Session>>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self {
             rooms: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -199,16 +266,35 @@ impl Registry {
         self.rooms.read().await.get(id).cloned()
     }
 
-    /// Get the demo room, creating it on first use. Until session creation
-    /// arrives (Phase 1+), every connection lands here — it exists so the
-    /// end-to-end WS flow is exercisable the moment the service boots.
+    pub async fn get_session(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.read().await.get(id).cloned()
+    }
+
+    /// Register a session. If the id is already live, the existing session
+    /// is kept and returned (idempotent create: a retried admin POST must
+    /// not nuke a session with people at its tables).
+    pub async fn insert_session(&self, session: Arc<Session>) -> (Arc<Session>, bool) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(existing) = sessions.get(&session.id) {
+            return (existing.clone(), false);
+        }
+        sessions.insert(session.id.clone(), session.clone());
+        (session, true)
+    }
+
+    pub async fn remove_session(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.write().await.remove(id)
+    }
+
+    /// Get the demo room, creating it on first use. Kept for dev: a ticket
+    /// with `session_id == "demo"` lands here without any admin setup.
     pub async fn demo_room(&self) -> Arc<Room> {
         let mut rooms = self.rooms.write().await;
         if let Some(r) = rooms.get("demo") {
             return r.clone();
         }
         let board = demo_board();
-        let room = Room::new("demo".to_string(), board);
+        let room = Room::new("demo".to_string(), board, None);
         rooms.insert("demo".to_string(), room.clone());
         room
     }
@@ -245,6 +331,8 @@ mod tests {
         let mut inner = RoomInner {
             table: TableState::new(board),
             seats: HashMap::new(),
+            board_index: 0,
+            ready: HashSet::new(),
         };
         assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
         assert_eq!(inner.seat_or_rebind("u2", "Bob"), Some(Direction::West));
@@ -260,6 +348,8 @@ mod tests {
         let mut inner = RoomInner {
             table: TableState::new(demo_board()),
             seats: HashMap::new(),
+            board_index: 0,
+            ready: HashSet::new(),
         };
         for sub in subs {
             inner.seat_or_rebind(sub, sub);

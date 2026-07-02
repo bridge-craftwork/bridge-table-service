@@ -13,6 +13,7 @@ mod engine;
 mod observability;
 mod rooms;
 mod routes;
+mod sessions;
 mod table;
 
 pub struct AppState {
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
         .merge(routes::health::router())
         .merge(routes::metrics::router())
         .merge(routes::dashboard::router())
+        .merge(routes::admin::router())
         .merge(routes::ws::router())
         .layer(middleware::from_fn(observability::metrics::track))
         .layer(TraceLayer::new_for_http())
