@@ -208,7 +208,7 @@ async fn act_once(room: &Room) -> bool {
 
     // Phase B: choose. May take seconds (BBA/BEN over HTTP); the state
     // lock is not held, so humans keep acting and undo keeps working.
-    let (seq, action, via) = match pending {
+    let (seq, action, via, opening_lead) = match pending {
         Pending::Bid {
             seat,
             seq,
@@ -216,11 +216,16 @@ async fn act_once(room: &Room) -> bool {
             calls,
         } => {
             let (call, via) = choose_call(room, &board, &calls).await;
-            (seq, Action::Call { seat, call }, via)
+            (seq, Action::Call { seat, call }, via, false)
         }
         Pending::Play(p) => {
             let (card, via) = choose_card(&p).await;
-            (p.seq, Action::Play { seat: p.seat, card }, via)
+            (
+                p.seq,
+                Action::Play { seat: p.seat, card },
+                via,
+                p.opening_lead,
+            )
         }
     };
 
@@ -283,6 +288,11 @@ async fn act_once(room: &Room) -> bool {
     let trick_pause = event["trick_winner"].is_string();
     drop(inner);
     room.broadcast(event.to_string());
+    // A bot's opening lead reveals dummy to everyone — trigger the same
+    // per-viewer resync a human opening lead (or an undo) does.
+    if opening_lead {
+        room.broadcast_resync();
+    }
     if trick_pause {
         tokio::time::sleep(AFTER_TRICK - BETWEEN_PLAYS).await;
     }

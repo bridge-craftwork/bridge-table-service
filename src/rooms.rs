@@ -18,6 +18,13 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::table::{BoardSetup, TableState};
 
+/// Internal broadcast marker telling every connection to send its own
+/// per-viewer redacted snapshot (a broadcast can't carry a snapshot because
+/// snapshots are per-viewer). Never forwarded to clients. Used after undo
+/// (a rewind can re-hide info) and after the opening lead (dummy goes face
+/// up for everyone).
+pub const RESYNC: &str = "__resync__";
+
 /// A seated (or recently seated) occupant.
 #[derive(Debug, Clone)]
 pub struct Occupant {
@@ -65,6 +72,11 @@ impl Room {
     /// receivers) are fine — an empty room still accepts actions.
     pub fn broadcast(&self, msg: String) {
         let _ = self.events.send(msg);
+    }
+
+    /// Ask every connection to rebuild and send its own redacted snapshot.
+    pub fn broadcast_resync(&self) {
+        self.broadcast(RESYNC.to_string());
     }
 
     /// A room on the demo board, for unit tests in other modules.

@@ -6,14 +6,15 @@
 //!                    stays out of proxy logs), then
 //!                    {"t":"bid","call":"1H"} | {"t":"play","card":"SA"} |
 //!                    {"t":"undo","to_seq":N} | {"t":"pong"}
-//!   server → client: {"t":"welcome"…} then {"t":"snapshot"…} on join and
-//!                    after any undo, {"t":"event"…} per action,
-//!                    {"t":"error"…}, {"t":"ping"}
+//!   server → client: {"t":"welcome"…} then {"t":"snapshot"…} on join,
+//!                    after any undo, and after the opening lead,
+//!                    {"t":"event"…} per action, {"t":"error"…}, {"t":"ping"}
 //!
 //! Every client gets a full redacted snapshot on (re)join — state is tiny,
 //! so there is no event-replay protocol. `seq` lets clients drop stale
 //! events. Undo broadcasts a fresh per-viewer snapshot because a rewind
-//! can re-hide information (e.g. undoing the opening lead hides dummy).
+//! can re-hide information (e.g. undoing the opening lead hides dummy);
+//! the opening lead broadcasts one because it reveals dummy to everyone.
 
 use axum::{
     extract::{
@@ -29,12 +30,9 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde_json::{json, Value};
 
 use crate::auth::{verify_ticket, Ticket};
+use crate::rooms::RESYNC;
 use crate::table::Action;
 use crate::SharedState;
-
-/// Internal broadcast marker telling every connection to send its own
-/// per-viewer snapshot (used after undo, where a rewind can re-hide info).
-const RESYNC: &str = "__resync__";
 
 pub fn router() -> Router<SharedState> {
     Router::new().route("/ws", get(upgrade))
@@ -306,6 +304,7 @@ async fn handle_client_msg(
             if !entitled {
                 return Some(err_msg("rejected", "not your turn"));
             }
+            let was_opening_lead = f.played.is_empty();
             match inner.table.apply(Action::Play {
                 seat: turn_seat,
                 card,
@@ -337,6 +336,11 @@ async fn handle_client_msg(
                     .to_string();
                     drop(inner);
                     room.broadcast(ev);
+                    // The opening lead reveals dummy to everyone — each
+                    // connection rebuilds its own redacted snapshot.
+                    if was_opening_lead {
+                        room.broadcast_resync();
+                    }
                     crate::bots::kick(room.clone());
                     None
                 }
@@ -365,7 +369,7 @@ async fn handle_client_msg(
                     // A rewind can re-hide info (e.g. undoing the opening
                     // lead hides dummy again), so every connection rebuilds
                     // its own redacted snapshot.
-                    room.broadcast(RESYNC.to_string());
+                    room.broadcast_resync();
                     crate::bots::kick(room.clone());
                     None
                 }
