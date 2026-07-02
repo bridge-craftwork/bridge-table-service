@@ -333,6 +333,20 @@ async fn act_once(room: &Room) -> bool {
     };
 
     let trick_pause = event["trick_winner"].is_string();
+    // A bot action can end the board (last card, or the 4th pass of a
+    // passed-out deal): broadcast the result like a human action would.
+    let complete = inner.table.board_result_json().map(|result| {
+        let mut ev = json!({
+            "t": "event",
+            "table_id": room.id,
+            "seq": new_seq,
+            "kind": "board_complete",
+        });
+        ev.as_object_mut()
+            .unwrap()
+            .extend(result.as_object().unwrap().clone());
+        ev.to_string()
+    });
     drop(inner);
     room.broadcast(event.to_string());
     // A bot's opening lead reveals dummy to everyone — trigger the same
@@ -340,6 +354,11 @@ async fn act_once(room: &Room) -> bool {
     if opening_lead {
         room.broadcast_resync();
     }
+    if let Some(complete) = complete {
+        room.broadcast(complete);
+    }
+    // Keep the teacher's lobby grid live (phase / trick counts / turn).
+    room.notify_session_lobby();
     if trick_pause {
         tokio::time::sleep(AFTER_TRICK - BETWEEN_PLAYS).await;
     }
