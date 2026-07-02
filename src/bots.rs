@@ -49,16 +49,24 @@ struct Clients {
 
 /// Initialize the HTTP bot backends and fire the BEN pre-warm (the first
 /// BEN call after idle costs ~10-20s; warming at startup absorbs it).
-pub fn init(ben_url: &str, bba_url: &str) {
+/// `ben_timeout` is the per-call BEN budget (`BOT_TIMEOUT_MS`); BBA keeps
+/// its own fixed budget (bidding shouldn't stall an auction that long).
+pub fn init(ben_url: &str, bba_url: &str, ben_timeout: Duration) {
     let clients = Clients {
-        ben: ben::BenClient::new(ben_url),
+        ben: ben::BenClient::new(ben_url, ben_timeout),
         bba: bba::BbaClient::new(bba_url),
     };
     clients.ben.warm();
     if CLIENTS.set(clients).is_err() {
         tracing::warn!(event = "bots_already_initialized", "");
     }
-    tracing::info!(event = "bots_initialized", ben_url, bba_url, "");
+    tracing::info!(
+        event = "bots_initialized",
+        ben_url,
+        bba_url,
+        ben_timeout_ms = ben_timeout.as_millis() as u64,
+        ""
+    );
 }
 
 fn clients() -> Option<&'static Clients> {

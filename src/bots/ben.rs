@@ -25,11 +25,6 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use bridge_types::{Call, Card, Direction, Rank, Suit, Vulnerability};
 
-/// Per-call budget. BEN answers in ~300ms–1s once warm; the ~20s cold start
-/// is absorbed by `warm()` at service startup. A slow call falls back to
-/// RandomLegal at the call site so a table never freezes.
-const TIMEOUT: Duration = Duration::from_secs(8);
-
 // ── Encoders (test vectors ported from benClient.js) ────────────────────
 
 /// Auction → BEN ctx string: `["Pass","1NT","X","XX","2H"]` → `"--1NDbRd2H"`.
@@ -99,11 +94,17 @@ pub struct BenClient {
 }
 
 impl BenClient {
-    pub fn new(base: &str) -> Self {
+    /// `timeout` is the per-call budget (`BOT_TIMEOUT_MS`, default 20s).
+    /// Warm BEN answers simple plays in ~300ms–1s, but opening leads and
+    /// early plays routinely take longer; the ~20s model cold start is
+    /// absorbed by `warm()` at service startup. A call slower than the
+    /// budget falls back to RandomLegal at the call site so a table never
+    /// freezes.
+    pub fn new(base: &str, timeout: Duration) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::builder()
-                .timeout(TIMEOUT)
+                .timeout(timeout)
                 .build()
                 .expect("reqwest client"),
         }

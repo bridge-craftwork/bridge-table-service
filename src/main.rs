@@ -32,7 +32,11 @@ async fn main() -> Result<()> {
 
     observability::logging::init(&cfg.log_level, &cfg.log_format);
     observability::metrics::init();
-    bots::init(&cfg.ben_url, &cfg.bba_url);
+    bots::init(
+        &cfg.ben_url,
+        &cfg.bba_url,
+        std::time::Duration::from_millis(cfg.bot_timeout_ms),
+    );
 
     let db = db::open(&cfg.database_path).await?;
 

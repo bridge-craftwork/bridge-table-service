@@ -12,6 +12,10 @@ pub struct Config {
     pub ben_url: String,
     /// BBA bidding engine (Windows-VM-hosted, public URL only).
     pub bba_url: String,
+    /// Per-call budget for BEN cardplay requests, in milliseconds. Leads
+    /// and early plays routinely need >8s even on a warm BEN; the
+    /// RandomLegal fallback still catches anything slower than this.
+    pub bot_timeout_ms: u64,
 }
 
 impl Config {
@@ -26,6 +30,9 @@ impl Config {
             ticket_secret: std::env::var("TICKET_SECRET").context("TICKET_SECRET is required")?,
             ben_url: env_or("BEN_URL", "https://ben.bridge-craftwork.com"),
             bba_url: env_or("BBA_URL", "https://bba.harmonicsystems.com"),
+            bot_timeout_ms: env_or("BOT_TIMEOUT_MS", "20000")
+                .parse()
+                .context("BOT_TIMEOUT_MS")?,
         })
     }
 }

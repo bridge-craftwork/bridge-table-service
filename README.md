@@ -70,8 +70,9 @@ colima stop && colima start --vz-rosetta   # one-time; persists across reboots
 | `TICKET_SECRET` | *required* | HMAC key for join tickets, shared with the bridge-classroom API |
 | `BEN_URL` | `https://ben.bridge-craftwork.com` | BEN cardplay engine. **On the droplet set `BEN_URL=http://ben:8085`** in the compose block — BEN runs on the same `bridge-net` docker network, so calls should stay internal instead of hairpinning through the public edge. |
 | `BBA_URL` | `https://bba.harmonicsystems.com` | BBA bidding engine (Windows-VM hosted; public URL is the only route) |
+| `BOT_TIMEOUT_MS` | `20000` | Per-call budget for BEN cardplay requests — opening leads and early plays can legitimately take >8s even on a warm BEN |
 
-Bot seats use BBA for bidding (with a per-room predicted-auction prefix cache; divergence or undo re-requests with `auctionPrefix`) and BEN for cardplay (encodings mirror the frontend's `benClient.js`). Every suggestion is validated through the legality engine; on timeout (8s), error, or an illegal suggestion the seat falls back to Pass / a random legal card, so a slow bot never freezes a table. BEN is pre-warmed at startup to absorb its ~20s model cold start.
+Bot seats use BBA for bidding (with a per-room predicted-auction prefix cache; divergence or undo re-requests with `auctionPrefix`) and BEN for cardplay (encodings mirror the frontend's `benClient.js`). Every suggestion is validated through the legality engine; on timeout (`BOT_TIMEOUT_MS` for BEN, 8s for BBA), error, or an illegal suggestion the seat falls back to Pass / a random legal card, so a slow bot never freezes a table. BEN is pre-warmed at startup to absorb its ~20s model cold start. For testing, a client can send `"bot":"random"` in its `hello` frame to switch the whole room to instant RandomLegal bots (Pass for bidding, deterministic legal card for play — no BBA/BEN calls); the `welcome` frame reports the active mode as `"bot_mode":"real"|"random"`.
 
 ## Sibling crate path-deps
 
