@@ -318,7 +318,7 @@ async fn choose_call(room: &Room, board: &BoardSetup, calls: &[Call]) -> (Call, 
                 }
             }
             Err(e) => {
-                tracing::warn!(event = "bba_failed", error = %e, "falling back to Pass")
+                tracing::warn!(event = "bba_failed", error = %format!("{e:#}"), "falling back to Pass")
             }
         }
     }
@@ -353,9 +353,14 @@ async fn choose_card(p: &PlayPending) -> (Card, &'static str) {
         };
         match result {
             Ok((card, player)) => {
+                // Live BEN names the DECISION-MAKER in `player`, not the
+                // physical seat: dummy plays come back as 3 (declarer), not
+                // 1 (benClient.js's comment assumes 1 — wrong empirically,
+                // observed 2026-07-01). Accept either mapping; the legality
+                // check against the acting seat's cards is the real guard.
                 let mismatched = player
                     .map(|pl| ben::player_to_seat(pl, p.declarer))
-                    .filter(|s| *s != p.seat);
+                    .filter(|s| *s != p.seat && *s != p.decision_maker);
                 if let Some(mapped) = mismatched {
                     tracing::warn!(
                         event = "ben_player_mismatch",
@@ -374,7 +379,9 @@ async fn choose_card(p: &PlayPending) -> (Card, &'static str) {
                 }
             }
             Err(e) => {
-                tracing::warn!(event = "ben_failed", error = %e, "falling back to RandomLegal")
+                // {:#} shows the anyhow cause chain (e.g. "operation timed
+                // out"), which is what distinguishes a slow BEN from a down one.
+                tracing::warn!(event = "ben_failed", error = %format!("{e:#}"), "falling back to RandomLegal")
             }
         }
     }
