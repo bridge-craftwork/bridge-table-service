@@ -527,7 +527,10 @@ fn rules_card(p: &PlayPending) -> Card {
     };
     match decision {
         Ok(d) => {
-            tracing::debug!(
+            // Info, not debug: this is the audit trail for evaluating the
+            // bot's play (the droplet runs LOG_LEVEL=info). Low volume — at
+            // most one line per bot card.
+            tracing::info!(
                 event = "rulebot_decision",
                 rule = d.rule,
                 legal_count = d.legal_count,
