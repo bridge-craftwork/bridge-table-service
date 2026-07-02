@@ -66,6 +66,12 @@ impl Room {
     pub fn broadcast(&self, msg: String) {
         let _ = self.events.send(msg);
     }
+
+    /// A room on the demo board, for unit tests in other modules.
+    #[cfg(test)]
+    pub fn new_for_test(id: &str) -> Arc<Self> {
+        Self::new(id.to_string(), demo_board())
+    }
 }
 
 impl RoomInner {

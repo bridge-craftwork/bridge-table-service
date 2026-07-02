@@ -58,6 +58,24 @@ fn err_msg(code: &str, msg: &str) -> String {
     json!({ "t": "error", "code": code, "msg": msg }).to_string()
 }
 
+/// One viewer's snapshot frame: redacted table state plus the seats map, so
+/// a (re)joining client learns who is human/connected without waiting for
+/// the next seat_update event.
+fn snapshot_msg(
+    room_id: &str,
+    inner: &crate::rooms::RoomInner,
+    seat: Option<Direction>,
+    see_all: bool,
+) -> String {
+    json!({
+        "t": "snapshot",
+        "table_id": room_id,
+        "state": inner.table.snapshot(seat, see_all),
+        "seats": inner.seats_json(),
+    })
+    .to_string()
+}
+
 async fn handle(mut socket: WebSocket, state: SharedState) {
     // First frame must be hello{ticket}.
     let ticket = match wait_for_hello(&mut socket, &state).await {
@@ -80,12 +98,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
             "seat": seat.map(|s| s.to_char().to_string()),
         })
         .to_string();
-        let snapshot = json!({
-            "t": "snapshot",
-            "table_id": room.id,
-            "state": inner.table.snapshot(seat, see_all),
-        })
-        .to_string();
+        let snapshot = snapshot_msg(&room.id, &inner, seat, see_all);
         let seats_event = json!({
             "t": "event",
             "table_id": room.id,
@@ -125,11 +138,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
                     // can't carry one. Each connection builds its own here.
                     Ok(msg) if msg == RESYNC => {
                         let inner = room.state.lock().await;
-                        let snap = json!({
-                            "t": "snapshot",
-                            "table_id": room.id,
-                            "state": inner.table.snapshot(seat, ticket.role == "teacher"),
-                        }).to_string();
+                        let snap = snapshot_msg(&room.id, &inner, seat, ticket.role == "teacher");
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -143,11 +152,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
                     // Lagged: resync with a fresh snapshot.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let inner = room.state.lock().await;
-                        let snap = json!({
-                            "t": "snapshot",
-                            "table_id": room.id,
-                            "state": inner.table.snapshot(seat, ticket.role == "teacher"),
-                        }).to_string();
+                        let snap = snapshot_msg(&room.id, &inner, seat, ticket.role == "teacher");
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -368,5 +373,27 @@ async fn handle_client_msg(
             }
         }
         _ => Some(err_msg("unknown", "unknown message type")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_includes_state_and_seats() {
+        let room = crate::rooms::Room::new_for_test("t1");
+        let mut inner = room.state.try_lock().unwrap();
+        inner.seat_or_rebind("u1", "Alice");
+        let msg = snapshot_msg("t1", &inner, Some(Direction::South), false);
+        let v: Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["t"], "snapshot");
+        assert_eq!(v["table_id"], "t1");
+        assert_eq!(v["state"]["your_seat"], "S");
+        // Seats travel with every snapshot so late joiners see who is
+        // human vs bot without waiting for a seat_update event.
+        assert_eq!(v["seats"]["S"]["kind"], "human");
+        assert_eq!(v["seats"]["S"]["name"], "Alice");
+        assert_eq!(v["seats"]["W"]["kind"], "empty");
     }
 }
