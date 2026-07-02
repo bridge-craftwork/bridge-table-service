@@ -6,6 +6,7 @@ use axum::{middleware, Router};
 use tower_http::trace::TraceLayer;
 
 mod auth;
+mod bots;
 mod config;
 mod db;
 mod engine;

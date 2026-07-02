@@ -263,7 +263,15 @@ impl TableState {
             (Phase::Bidding, Some(seat)) if see_all || viewer_seat == Some(seat) => {
                 json!({ "seat": seat.to_char().to_string(), "kind": "call" })
             }
-            (Phase::Play, Some(seat)) if see_all || viewer_seat == Some(seat) => {
+            // Declarer also sees dummy's legal cards (declarer plays dummy).
+            (Phase::Play, Some(seat))
+                if see_all
+                    || viewer_seat == Some(seat)
+                    || (f
+                        .contract
+                        .as_ref()
+                        .is_some_and(|c| viewer_seat == Some(c.declarer) && seat == c.dummy())) =>
+            {
                 let lead_suit = current_lead_suit(&f);
                 let legal = play::legal_cards(&self.remaining(seat, &f), lead_suit)
                     .iter()

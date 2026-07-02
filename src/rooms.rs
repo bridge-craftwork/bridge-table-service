@@ -32,6 +32,8 @@ pub struct Room {
     pub state: Mutex<RoomInner>,
     /// Serialized ServerMsg JSON, fanned out to every socket in the room.
     pub events: broadcast::Sender<String>,
+    /// True while a bot-driver task is live for this room (see bots::kick).
+    pub bot_running: std::sync::atomic::AtomicBool,
 }
 
 pub struct RoomInner {
@@ -49,6 +51,7 @@ impl Room {
                 seats: HashMap::new(),
             }),
             events,
+            bot_running: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

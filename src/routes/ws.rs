@@ -104,6 +104,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
     )
     .await;
     room.broadcast(seats_event);
+    crate::bots::kick(room.clone());
 
     let mut events = room.events.subscribe();
     let (mut tx, mut rx) = socket.split();
@@ -239,7 +240,7 @@ async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<T
 /// Apply one client message to the room. Returns an error frame to send back
 /// to *this* client only (successful actions broadcast to the whole room).
 async fn handle_client_msg(
-    room: &crate::rooms::Room,
+    room: &std::sync::Arc<crate::rooms::Room>,
     ticket: &Ticket,
     seat: Option<Direction>,
     v: &Value,
@@ -271,6 +272,7 @@ async fn handle_client_msg(
                     .to_string();
                     drop(inner);
                     room.broadcast(ev);
+                    crate::bots::kick(room.clone());
                     None
                 }
                 Err(e) => Some(err_msg("rejected", &e)),
@@ -284,7 +286,25 @@ async fn handle_client_msg(
                 return Some(err_msg("bad_card", "unrecognized card"));
             };
             let mut inner = room.state.lock().await;
-            match inner.table.apply(Action::Play { seat, card }) {
+            // Server-authoritative seat resolution: a play always targets the
+            // seat on turn. The sender is entitled if that's their own seat,
+            // or if they're the declarer and the seat on turn is the dummy
+            // (declarer plays dummy's cards).
+            let f = inner.table.fold();
+            let Some(turn_seat) = f.next_to_act else {
+                return Some(err_msg("rejected", "no one is on turn"));
+            };
+            let entitled = turn_seat == seat
+                || f.contract
+                    .as_ref()
+                    .is_some_and(|c| c.declarer == seat && turn_seat == c.dummy());
+            if !entitled {
+                return Some(err_msg("rejected", "not your turn"));
+            }
+            match inner.table.apply(Action::Play {
+                seat: turn_seat,
+                card,
+            }) {
                 Ok(seq) => {
                     let f = inner.table.fold();
                     // A trick just completed iff this play was a trick's 4th
@@ -303,7 +323,7 @@ async fn handle_client_msg(
                         "table_id": room.id,
                         "seq": seq,
                         "kind": "card_played",
-                        "seat": seat.to_char().to_string(),
+                        "seat": turn_seat.to_char().to_string(),
                         "card": v["card"].as_str(),
                         "next_to_act": f.next_to_act.map(|d| d.to_char().to_string()),
                         "trick_winner": trick_winner,
@@ -312,6 +332,7 @@ async fn handle_client_msg(
                     .to_string();
                     drop(inner);
                     room.broadcast(ev);
+                    crate::bots::kick(room.clone());
                     None
                 }
                 Err(e) => Some(err_msg("rejected", &e)),
@@ -340,6 +361,7 @@ async fn handle_client_msg(
                     // lead hides dummy again), so every connection rebuilds
                     // its own redacted snapshot.
                     room.broadcast(RESYNC.to_string());
+                    crate::bots::kick(room.clone());
                     None
                 }
                 Err(e) => Some(err_msg("rejected", &e)),
