@@ -266,27 +266,35 @@ impl TableState {
     /// viewer occupies (None for kibitzers). `see_all` is teacher/demo mode.
     ///
     /// Redaction rules: you see your own hand; everyone sees dummy once the
-    /// opening lead is made; `see_all` sees everything. Hidden hands are
+    /// opening lead is made; `see_all` sees everything; a COMPLETE board
+    /// shows every seat's ORIGINAL hand to everyone (post-mortem review —
+    /// the remaining cards would all be empty anyway). Hidden hands are
     /// reported as card *counts* so the UI can render card backs.
     pub fn snapshot(&self, viewer_seat: Option<Direction>, see_all: bool) -> Value {
         let f = self.fold();
         let dummy = f.contract.as_ref().map(|c| c.dummy());
+        let complete = f.phase == Phase::Complete;
 
         let mut hands = serde_json::Map::new();
         for seat in Direction::ALL {
-            let remaining = self.remaining(seat, &f);
-            let visible = see_all
+            let cards = if complete {
+                self.board.deal.hand(seat).cards().to_vec()
+            } else {
+                self.remaining(seat, &f)
+            };
+            let visible = complete
+                || see_all
                 || viewer_seat == Some(seat)
                 || (f.opening_lead_made && dummy == Some(seat));
             let entry = if visible {
                 json!({
                     "visible": true,
-                    "cards": remaining.iter()
+                    "cards": cards.iter()
                         .map(|c| format!("{}{}", c.suit.to_char(), c.rank.to_char()))
                         .collect::<Vec<_>>(),
                 })
             } else {
-                json!({ "visible": false, "count": remaining.len() })
+                json!({ "visible": false, "count": cards.len() })
             };
             hands.insert(seat.to_char().to_string(), entry);
         }
@@ -555,6 +563,35 @@ mod tests {
         let snap = t.snapshot(None, true);
         assert_eq!(snap["hands"]["N"]["visible"], true);
         assert_eq!(snap["hands"]["W"]["visible"], true);
+    }
+
+    #[test]
+    fn snapshot_shows_original_deal_to_everyone_when_complete() {
+        // A passed-out board reaches Complete with all 52 cards unplayed —
+        // the review view must show every ORIGINAL hand to any viewer,
+        // player and kibitzer alike.
+        let mut t = setup();
+        apply_calls(
+            &mut t,
+            &[
+                (North, "Pass"),
+                (East, "Pass"),
+                (South, "Pass"),
+                (West, "Pass"),
+            ],
+        );
+
+        let snap = t.snapshot(Some(South), false);
+        assert_eq!(snap["phase"], "complete");
+        for seat in ["N", "E", "S", "W"] {
+            assert_eq!(snap["hands"][seat]["visible"], true, "seat {seat}");
+            assert_eq!(snap["hands"][seat]["cards"].as_array().unwrap().len(), 13);
+        }
+
+        // Kibitzer too.
+        let snap = t.snapshot(None, false);
+        assert_eq!(snap["hands"]["N"]["visible"], true);
+        assert_eq!(snap["hands"]["N"]["cards"].as_array().unwrap().len(), 13);
     }
 
     #[test]

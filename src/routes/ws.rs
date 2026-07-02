@@ -802,6 +802,10 @@ async fn handle_client_msg(
                     room.broadcast(ev);
                     if let Some(complete) = complete {
                         room.broadcast(complete);
+                        // A finished board reveals the original deal to
+                        // everyone for review (snapshot() un-redacts at
+                        // Phase::Complete) — push per-viewer snapshots.
+                        room.broadcast_resync();
                     }
                     room.notify_session_lobby();
                     crate::bots::kick(room.clone());
@@ -873,6 +877,10 @@ async fn handle_client_msg(
                     }
                     if let Some(complete) = complete {
                         room.broadcast(complete);
+                        // A finished board reveals the original deal to
+                        // everyone for review (snapshot() un-redacts at
+                        // Phase::Complete) — push per-viewer snapshots.
+                        room.broadcast_resync();
                     }
                     room.notify_session_lobby();
                     crate::bots::kick(room.clone());

@@ -373,6 +373,9 @@ async fn act_once(room: &Room) -> bool {
     }
     if let Some(complete) = complete {
         room.broadcast(complete);
+        // A finished board reveals the original deal to everyone for review
+        // (snapshot() un-redacts at Phase::Complete) — push snapshots.
+        room.broadcast_resync();
     }
     // Keep the teacher's lobby grid live (phase / trick counts / turn).
     room.notify_session_lobby();
