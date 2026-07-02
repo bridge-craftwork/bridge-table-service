@@ -115,6 +115,9 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
     )
     .await;
     room.broadcast(seats_event);
+    // Watchdog so bot takeover of a later-disconnected seat fires without
+    // another human action, plus an immediate kick for this join.
+    crate::bots::ensure_keepalive(room.clone());
     crate::bots::kick(room.clone());
 
     let mut events = room.events.subscribe();
@@ -175,8 +178,9 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
         }
     }
 
-    // Socket gone: mark the seat disconnected (bot-takeover policy lands in
-    // Phase 2; for now the seat just greys out and rebinds on return).
+    // Socket gone: mark the seat disconnected. The seat stays bound to this
+    // sub (a reconnect rebinds it); after the zombie-seat grace period the
+    // keepalive-kicked bot driver plays for it (rooms::seat_bot_controlled).
     {
         let mut inner = room.state.lock().await;
         inner.mark_disconnected(&ticket.sub);

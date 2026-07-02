@@ -1,8 +1,11 @@
 //! Bot seats.
 //!
-//! Any unoccupied seat is a bot (with one exception: a human declarer plays
-//! the dummy's cards, so the dummy seat is driven by the declarer, not a
-//! bot). This mirrors the frontend's pluggable-bot design (`cardplayBots.js`):
+//! Any unoccupied seat is a bot, and a seat whose human has been
+//! disconnected past the zombie-seat grace period (see
+//! `RoomInner::seat_bot_controlled`) is bot-driven until the human
+//! reconnects. One exception: a human declarer plays the dummy's cards, so
+//! the dummy seat is driven by whoever controls the declarer seat, not a
+//! bot. This mirrors the frontend's pluggable-bot design (`cardplayBots.js`):
 //! bidding is BBA (prefix-cached, see `bba`), cardplay is BEN (see `ben`),
 //! and every suggestion is validated through the engine with `RandomLegal`
 //! (Pass, for bidding) as the always-available fallback — a slow or wrong
@@ -20,7 +23,7 @@ pub mod ben;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bridge_types::{Call, Card, Direction, Vulnerability};
 use once_cell::sync::OnceCell;
@@ -68,6 +71,30 @@ fn pick<T: Copy>(options: &[T], seq: usize) -> T {
     options[(seq.wrapping_mul(2654435761)) % options.len()]
 }
 
+/// Keepalive watchdog cadence — how often an idle room re-checks whether a
+/// bot should act. This is what makes zombie-seat takeover happen without
+/// another human action: the grace period expires, the next tick kicks the
+/// driver, the bot plays.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Spawn the per-room keepalive watchdog (idempotent — at most one task per
+/// room). Rooms live for the process lifetime (in-memory registry, no
+/// eviction), so the task never needs to stop; each tick is one cheap
+/// lock-and-fold when nothing is pending.
+pub fn ensure_keepalive(room: Arc<Room>) {
+    if room.keepalive_running.swap(true, Ordering::SeqCst) {
+        return; // already watching
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            kick(room.clone());
+        }
+    });
+}
+
 /// Kick the bot driver for a room. Cheap to call after every state change;
 /// only one task runs at a time.
 pub fn kick(room: Arc<Room>) {
@@ -101,16 +128,17 @@ async fn bot_turn_pending(room: &Room) -> bool {
 
 /// Whether the bot driver should act for `seat`. Control of the dummy
 /// belongs to whoever controls the declarer seat (bridge: declarer plays
-/// dummy's cards) — so the dummy is bot-driven iff the declarer seat is
-/// unoccupied, regardless of who sits at dummy. Every other seat is
-/// bot-driven iff unoccupied.
+/// dummy's cards) — so the dummy is bot-driven iff the *declarer* seat is
+/// bot-controlled, regardless of who sits at dummy. A seat is
+/// bot-controlled when empty or when its human has been disconnected past
+/// the zombie-seat grace period (`seat_bot_controlled`). This is only ever
+/// asked about the seat on turn, so the on-turn grace period applies.
 fn is_bot_seat(inner: &crate::rooms::RoomInner, f: &crate::table::Folded, seat: Direction) -> bool {
-    if let Some(c) = &f.contract {
-        if seat == c.dummy() {
-            return !inner.seats.contains_key(&c.declarer);
-        }
-    }
-    !inner.seats.contains_key(&seat)
+    let controller = match &f.contract {
+        Some(c) if seat == c.dummy() => c.declarer,
+        _ => seat,
+    };
+    inner.seat_bot_controlled(controller, true, Instant::now())
 }
 
 /// Everything a bot needs to decide, captured under the state lock so the
@@ -396,4 +424,55 @@ async fn choose_card(p: &PlayPending) -> (Card, &'static str) {
         }
     }
     (pick(&p.legal, p.seq), "random")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bridge_types::Direction::*;
+
+    /// Zombie-seat takeover through the driver's own gate: a fully human
+    /// table has no pending bot turn until the seat on turn has been
+    /// disconnected past the grace period, and a reconnect reclaims control
+    /// instantly. The clock is injected by editing `disconnected_at`
+    /// directly — no sleeps.
+    #[tokio::test]
+    async fn disconnected_seat_becomes_bot_driven_after_grace() {
+        let room = crate::rooms::Room::new_for_test("t");
+        {
+            let mut inner = room.state.lock().await;
+            for sub in ["u1", "u2", "u3", "u4"] {
+                inner.seat_or_rebind(sub, sub); // S, W, N, E
+            }
+        }
+        // Demo board's dealer is North (= "u3"), so North is on turn.
+        assert!(!bot_turn_pending(&room).await, "all humans connected");
+
+        room.state.lock().await.mark_disconnected("u3");
+        assert!(
+            !bot_turn_pending(&room).await,
+            "freshly disconnected: still within grace"
+        );
+
+        // Backdate the disconnect past the on-turn grace period.
+        room.state
+            .lock()
+            .await
+            .seats
+            .get_mut(&North)
+            .unwrap()
+            .disconnected_at =
+            Some(Instant::now() - crate::rooms::TAKEOVER_AFTER_ON_TURN - Duration::from_secs(1));
+        assert!(
+            bot_turn_pending(&room).await,
+            "grace expired: bot takes over"
+        );
+
+        // Reconnect: same sub rebinds the same seat, takeover ends.
+        assert_eq!(
+            room.state.lock().await.seat_or_rebind("u3", "u3"),
+            Some(North)
+        );
+        assert!(!bot_turn_pending(&room).await, "human reclaimed the seat");
+    }
 }

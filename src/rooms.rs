@@ -12,11 +12,21 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bridge_types::{Call, Direction};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::table::{BoardSetup, TableState};
+
+/// Zombie-seat policy: how long a disconnected occupant keeps their seat
+/// human-driven before the bot driver takes over. The seat binding itself
+/// is never released — the human reclaims control simply by reconnecting
+/// (takeover is a mode check, not a re-seat).
+pub const TAKEOVER_AFTER: Duration = Duration::from_secs(60);
+/// Shorter grace when the table is blocked waiting on the disconnected
+/// seat's turn.
+pub const TAKEOVER_AFTER_ON_TURN: Duration = Duration::from_secs(20);
 
 /// Internal broadcast marker telling every connection to send its own
 /// per-viewer redacted snapshot (a broadcast can't carry a snapshot because
@@ -32,6 +42,9 @@ pub struct Occupant {
     pub sub: String,
     pub name: String,
     pub connected: bool,
+    /// When the occupant's socket dropped (None while connected). Drives
+    /// the bot-takeover grace periods above.
+    pub disconnected_at: Option<Instant>,
 }
 
 pub struct Room {
@@ -41,6 +54,10 @@ pub struct Room {
     pub events: broadcast::Sender<String>,
     /// True while a bot-driver task is live for this room (see bots::kick).
     pub bot_running: std::sync::atomic::AtomicBool,
+    /// True once the per-room keepalive watchdog is spawned (see
+    /// bots::ensure_keepalive) — it periodically re-kicks the driver so a
+    /// disconnected seat's bot takeover happens without another human action.
+    pub keepalive_running: std::sync::atomic::AtomicBool,
     /// BBA's predicted auction for the current board (complete, from call
     /// 1). Bot calls are served from it while the actual auction remains a
     /// prefix; divergence or undo re-requests (see bots/bba.rs). Separate
@@ -64,6 +81,7 @@ impl Room {
             }),
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
+            keepalive_running: std::sync::atomic::AtomicBool::new(false),
             bba_cache: Mutex::new(None),
         })
     }
@@ -95,6 +113,7 @@ impl RoomInner {
         if let Some((&seat, _)) = self.seats.iter().find(|(_, o)| o.sub == sub) {
             let occ = self.seats.get_mut(&seat).unwrap();
             occ.connected = true;
+            occ.disconnected_at = None;
             occ.name = name.to_string();
             return Some(seat);
         }
@@ -104,6 +123,7 @@ impl RoomInner {
                     sub: sub.to_string(),
                     name: name.to_string(),
                     connected: true,
+                    disconnected_at: None,
                 });
                 return Some(seat);
             }
@@ -115,8 +135,31 @@ impl RoomInner {
         for occ in self.seats.values_mut() {
             if occ.sub == sub {
                 occ.connected = false;
+                occ.disconnected_at = Some(Instant::now());
             }
         }
+    }
+
+    /// Zombie-seat policy: should the bot driver act for `seat` right now?
+    /// True for an empty seat, and for a seat whose occupant has been
+    /// disconnected past the grace period (`TAKEOVER_AFTER_ON_TURN` when the
+    /// table is waiting on this seat, `TAKEOVER_AFTER` otherwise). The seat
+    /// binding is untouched — a reconnect (seat_or_rebind) instantly returns
+    /// control to the human. `now` is injected for testability.
+    pub fn seat_bot_controlled(&self, seat: Direction, on_turn: bool, now: Instant) -> bool {
+        let Some(occ) = self.seats.get(&seat) else {
+            return true; // empty seat: always a bot
+        };
+        if occ.connected {
+            return false;
+        }
+        let grace = if on_turn {
+            TAKEOVER_AFTER_ON_TURN
+        } else {
+            TAKEOVER_AFTER
+        };
+        occ.disconnected_at
+            .is_some_and(|t| now.duration_since(t) >= grace)
     }
 
     pub fn seats_json(&self) -> serde_json::Value {
@@ -206,5 +249,68 @@ mod tests {
         assert_eq!(inner.seat_or_rebind("u4", "Dee"), Some(Direction::East));
         // Fifth person kibitzes.
         assert_eq!(inner.seat_or_rebind("u5", "Eve"), None);
+    }
+
+    fn inner_with(subs: &[&str]) -> RoomInner {
+        let mut inner = RoomInner {
+            table: TableState::new(demo_board()),
+            seats: HashMap::new(),
+        };
+        for sub in subs {
+            inner.seat_or_rebind(sub, sub);
+        }
+        inner
+    }
+
+    #[test]
+    fn empty_seat_is_always_bot_controlled() {
+        let inner = inner_with(&[]);
+        let now = Instant::now();
+        assert!(inner.seat_bot_controlled(Direction::South, true, now));
+        assert!(inner.seat_bot_controlled(Direction::South, false, now));
+    }
+
+    #[test]
+    fn connected_occupant_is_never_bot_controlled() {
+        let inner = inner_with(&["u1"]); // u1 → South
+        let now = Instant::now();
+        assert!(!inner.seat_bot_controlled(Direction::South, true, now));
+        assert!(!inner.seat_bot_controlled(Direction::South, false, now));
+    }
+
+    #[test]
+    fn takeover_waits_out_the_grace_period() {
+        let mut inner = inner_with(&["u1"]);
+        inner.mark_disconnected("u1");
+        let dropped = inner.seats[&Direction::South].disconnected_at.unwrap();
+
+        // Within both grace periods: still human-driven.
+        let t = dropped + Duration::from_secs(19);
+        assert!(!inner.seat_bot_controlled(Direction::South, true, t));
+        assert!(!inner.seat_bot_controlled(Direction::South, false, t));
+
+        // Past the on-turn grace (20s) but not the idle one (60s).
+        let t = dropped + Duration::from_secs(21);
+        assert!(inner.seat_bot_controlled(Direction::South, true, t));
+        assert!(!inner.seat_bot_controlled(Direction::South, false, t));
+
+        // Past both.
+        let t = dropped + Duration::from_secs(61);
+        assert!(inner.seat_bot_controlled(Direction::South, true, t));
+        assert!(inner.seat_bot_controlled(Direction::South, false, t));
+    }
+
+    #[test]
+    fn reconnect_reclaims_the_seat_immediately() {
+        let mut inner = inner_with(&["u1"]);
+        inner.mark_disconnected("u1");
+        let dropped = inner.seats[&Direction::South].disconnected_at.unwrap();
+        let long_gone = dropped + Duration::from_secs(300);
+        assert!(inner.seat_bot_controlled(Direction::South, true, long_gone));
+
+        // Same sub reconnecting rebinds the SAME seat and ends the takeover
+        // (mode check, not a re-seat — the binding never moved).
+        assert_eq!(inner.seat_or_rebind("u1", "u1"), Some(Direction::South));
+        assert!(!inner.seat_bot_controlled(Direction::South, true, long_gone));
     }
 }
