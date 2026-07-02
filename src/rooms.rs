@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use bridge_types::{Call, Direction};
+use bridge_types::{Call, Direction, Vulnerability};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::sessions::Session;
@@ -354,6 +354,95 @@ impl Registry {
     }
 }
 
+/// Standard duplicate vulnerability for a board number (16-board cycle).
+fn vulnerability_for(number: u32) -> Vulnerability {
+    const CYCLE: [Vulnerability; 16] = [
+        Vulnerability::None,
+        Vulnerability::NorthSouth,
+        Vulnerability::EastWest,
+        Vulnerability::Both,
+        Vulnerability::NorthSouth,
+        Vulnerability::EastWest,
+        Vulnerability::Both,
+        Vulnerability::None,
+        Vulnerability::EastWest,
+        Vulnerability::Both,
+        Vulnerability::None,
+        Vulnerability::NorthSouth,
+        Vulnerability::Both,
+        Vulnerability::None,
+        Vulnerability::NorthSouth,
+        Vulnerability::EastWest,
+    ];
+    CYCLE[((number.max(1) - 1) % 16) as usize]
+}
+
+/// A uniformly random board: 52-card shuffle, standard dealer rotation and
+/// vulnerability cycle for `number`. Plain `rand` — deliberately NOT the
+/// dealer3 constraint engine (that's the "dealer script" source).
+pub fn random_board(number: u32) -> BoardSetup {
+    use bridge_types::{Card, Deal, Hand};
+    use rand::seq::SliceRandom;
+
+    let mut cards: Vec<Card> = (0..52).filter_map(Card::from_index).collect();
+    cards.shuffle(&mut rand::thread_rng());
+    let mut deal = Deal::new();
+    for (i, seat) in Direction::ALL.iter().enumerate() {
+        let mut hand = Hand::new();
+        for c in &cards[i * 13..(i + 1) * 13] {
+            hand.add_card(*c);
+        }
+        hand.sort();
+        deal.set_hand(*seat, hand);
+    }
+    BoardSetup {
+        number,
+        dealer: Direction::ALL[((number.max(1) - 1) % 4) as usize],
+        vulnerable: vulnerability_for(number),
+        deal,
+    }
+}
+
+/// Parse a client-supplied single-board PBN into a BoardSetup, optionally
+/// rotating the deal `rotate` seats clockwise (each hand's owner moves
+/// N→E→S→W; dealer rotates with it — "auto-rotate rotates the deal, not
+/// the players"). Rejects anything without a complete 52-card deal.
+pub fn board_from_pbn(pbn: &str, rotate: u8, number: u32) -> Result<BoardSetup, String> {
+    let boards = bridge_encodings::pbn::read_pbn(pbn).map_err(|e| format!("PBN parse: {e}"))?;
+    let b = boards.first().ok_or("PBN contains no boards")?;
+    let mut setup = BoardSetup {
+        number: b.number.unwrap_or(number),
+        dealer: b.dealer.unwrap_or(Direction::North),
+        vulnerable: b.vulnerable,
+        deal: b.deal.clone(),
+    };
+    if setup.deal.total_cards() != 52 {
+        return Err(format!(
+            "deal has {} cards, expected 52",
+            setup.deal.total_cards()
+        ));
+    }
+    for _ in 0..(rotate % 4) {
+        setup = rotate_board_one(setup);
+    }
+    Ok(setup)
+}
+
+/// Rotate every hand (and the dealer) one seat clockwise.
+fn rotate_board_one(b: BoardSetup) -> BoardSetup {
+    use bridge_types::Deal;
+    let mut deal = Deal::new();
+    for seat in Direction::ALL {
+        deal.set_hand(seat.next(), b.deal.hand(seat).clone());
+    }
+    BoardSetup {
+        number: b.number,
+        dealer: b.dealer.next(),
+        vulnerable: b.vulnerable,
+        deal,
+    }
+}
+
 /// Board 1 of the PBN spec's example deal — a fixed, valid deal so the demo
 /// table is deterministic.
 fn demo_board() -> BoardSetup {
@@ -377,6 +466,40 @@ mod tests {
         let b = demo_board();
         assert_eq!(b.deal.total_cards(), 52);
         assert_eq!(b.dealer, Direction::North);
+    }
+
+    #[test]
+    fn random_board_is_complete_with_standard_rotation() {
+        let b = random_board(2);
+        assert_eq!(b.deal.total_cards(), 52);
+        assert!(b.deal.is_valid());
+        assert_eq!(b.dealer, Direction::East); // board 2 dealer
+        assert_eq!(b.vulnerable, Vulnerability::NorthSouth); // board 2 vul
+                                                             // Two shuffles almost surely differ (collision odds are astronomical).
+        let b2 = random_board(2);
+        assert_ne!(
+            b.deal.hand(Direction::North).cards(),
+            b2.deal.hand(Direction::North).cards()
+        );
+    }
+
+    #[test]
+    fn board_from_pbn_parses_and_rotates() {
+        let pbn = "[Board \"7\"]\n[Dealer \"S\"]\n[Vulnerable \"Both\"]\n[Deal \"N:K843.T542.J6.863 AQJ7.K.Q75.AT942 962.AJ7.KT82.J75 T5.Q9863.A943.KQ\"]\n";
+        let b = board_from_pbn(pbn, 0, 99).unwrap();
+        assert_eq!(b.number, 7);
+        assert_eq!(b.dealer, Direction::South);
+        assert_eq!(b.vulnerable, Vulnerability::Both);
+        let north_cards = b.deal.hand(Direction::North).cards().to_vec();
+
+        // Rotate 1: every hand moves one seat clockwise, dealer too.
+        let r = board_from_pbn(pbn, 1, 99).unwrap();
+        assert_eq!(r.dealer, Direction::West);
+        assert_eq!(r.deal.hand(Direction::East).cards().to_vec(), north_cards);
+        assert_eq!(r.deal.total_cards(), 52);
+
+        // Garbage and short deals are rejected.
+        assert!(board_from_pbn("not pbn at all", 0, 1).is_err());
     }
 
     #[test]

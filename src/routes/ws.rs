@@ -947,6 +947,76 @@ async fn handle_client_msg(
             session.notify_lobby();
             None
         }
+        Some("deal") => {
+            // Deal-source controls (roadmap Phase 2). Demo room only: any
+            // seated player may re-deal; session boards stay owned by the
+            // teacher console's round flow.
+            if seat.is_none() {
+                return Some(err_msg("not_seated", "kibitzers cannot deal"));
+            }
+            if session.is_some() {
+                return Some(err_msg(
+                    "session_table",
+                    "session boards are managed by the teacher console",
+                ));
+            }
+            let source = v["source"].as_str().unwrap_or("");
+            let ev = {
+                let mut inner = room.state.lock().await;
+                match source {
+                    // Same board again: the undo machinery truncated to 0.
+                    "replay" => {
+                        let _ = inner.table.undo_to(0);
+                    }
+                    "random" => {
+                        let number = inner.table.board.number + 1;
+                        inner.table =
+                            crate::table::TableState::new(crate::rooms::random_board(number));
+                    }
+                    // Client-fetched deals (scenario/lesson PBNs, pasted PBN,
+                    // URL-parameter deals) all come through this one door.
+                    "pbn" => {
+                        let Some(pbn) = v["pbn"].as_str() else {
+                            return Some(err_msg("bad_pbn", "deal.pbn missing"));
+                        };
+                        if pbn.len() > 64 * 1024 {
+                            return Some(err_msg("bad_pbn", "PBN too large"));
+                        }
+                        let rotate = (v["rotate"].as_u64().unwrap_or(0) % 4) as u8;
+                        let number = inner.table.board.number + 1;
+                        match crate::rooms::board_from_pbn(pbn, rotate, number) {
+                            Ok(board) => inner.table = crate::table::TableState::new(board),
+                            Err(e) => return Some(err_msg("bad_pbn", &e)),
+                        }
+                    }
+                    _ => {
+                        return Some(err_msg(
+                            "bad_source",
+                            "source must be random, replay, or pbn",
+                        ))
+                    }
+                }
+                inner.ready.clear();
+                json!({
+                    "t": "event",
+                    "table_id": room.id,
+                    "seq": 0,
+                    "kind": "board_advanced",
+                    "board_no": inner.table.board.number,
+                    "source": source,
+                    "by": ticket.name,
+                })
+                .to_string()
+            };
+            tracing::info!(event = "deal_applied", source, room = %room.id, sub = %ticket.sub, "");
+            // A new (or rewound) board invalidates the BBA prediction.
+            *room.bba_cache.lock().await = None;
+            room.broadcast(ev);
+            // Per-viewer snapshots for the fresh board.
+            room.broadcast_resync();
+            crate::bots::kick(room.clone());
+            None
+        }
         _ => Some(err_msg("unknown", "unknown message type")),
     }
 }
