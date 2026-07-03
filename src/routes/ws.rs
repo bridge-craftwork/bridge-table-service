@@ -86,7 +86,12 @@ fn snapshot_msg(
     json!({
         "t": "snapshot",
         "table_id": room_id,
-        "state": inner.table.snapshot(seat, see_all),
+        "state": inner.table.snapshot(
+            seat,
+            see_all,
+            inner.board_mode == crate::rooms::BoardMode::BidOnly,
+        ),
+        "board_mode": inner.board_mode.as_str(),
         "seats": inner.seats_json(),
     })
     .to_string()
@@ -107,7 +112,7 @@ fn seats_event(room: &Room, inner: &crate::rooms::RoomInner) -> String {
 /// Built under the room lock; broadcast by the caller after dropping it.
 /// Results are not persisted (v1) — this broadcast is the whole delivery.
 fn board_complete_msg(room_id: &str, inner: &crate::rooms::RoomInner) -> Option<String> {
-    inner.table.board_result_json().map(|result| {
+    inner.result_json().map(|result| {
         let mut ev = json!({
             "t": "event",
             "table_id": room_id,
@@ -781,6 +786,12 @@ async fn handle_client_msg(
                 return Some(err_msg("bad_call", "unrecognized call"));
             };
             let mut inner = room.state.lock().await;
+            if inner.board_mode == crate::rooms::BoardMode::PlayOnly {
+                return Some(err_msg(
+                    "play_only",
+                    "the auction is automatic on this board",
+                ));
+            }
             match inner.table.apply(Action::Call {
                 seat,
                 call: call.clone(),
@@ -822,6 +833,12 @@ async fn handle_client_msg(
                 return Some(err_msg("bad_card", "unrecognized card"));
             };
             let mut inner = room.state.lock().await;
+            if inner.board_mode == crate::rooms::BoardMode::BidOnly {
+                return Some(err_msg(
+                    "bid_only",
+                    "this board ends at the contract — no cardplay",
+                ));
+            }
             // Server-authoritative seat resolution: a play always targets the
             // seat on turn. The sender is entitled if that's their own seat,
             // or if they control the declarer side and the seat on turn is a
@@ -991,6 +1008,10 @@ async fn handle_client_msg(
             };
             let ev = {
                 let mut inner = room.state.lock().await;
+                // Optional sticky board mode rides along with the deal.
+                if let Some(m) = v["mode"].as_str().and_then(crate::rooms::BoardMode::parse) {
+                    inner.board_mode = m;
+                }
                 match source {
                     // Same board again: the undo machinery truncated to 0.
                     "replay" => {

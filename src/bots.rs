@@ -129,9 +129,20 @@ async fn bot_turn_pending(room: &Room) -> bool {
     let inner = room.state.lock().await;
     let f = inner.table.fold();
     match f.next_to_act {
-        Some(seat) => is_bot_seat(&inner, &f, seat),
+        Some(seat) => mode_allows_bot(&inner, &f) && is_bot_seat(&inner, &f, seat),
         None => false,
     }
+}
+
+/// Board-mode gate for the driver: bid-only boards have no bot cardplay
+/// (the board is over at the contract); play-only boards let bots bid for
+/// EVERY seat (the auction is automatic — see rooms::BoardMode).
+fn mode_allows_bot(inner: &crate::rooms::RoomInner, f: &crate::table::Folded) -> bool {
+    !(inner.board_mode == crate::rooms::BoardMode::BidOnly && f.phase == Phase::Play)
+}
+
+fn mode_forces_bot(inner: &crate::rooms::RoomInner, f: &crate::table::Folded) -> bool {
+    inner.board_mode == crate::rooms::BoardMode::PlayOnly && f.phase == Phase::Bidding
 }
 
 /// Whether the bot driver should act for `seat`. Control of the dummy
@@ -211,7 +222,10 @@ async fn act_once(room: &Room) -> bool {
         let Some(seat) = f.next_to_act else {
             return false;
         };
-        if !is_bot_seat(&inner, &f, seat) {
+        if !mode_allows_bot(&inner, &f) {
+            return false;
+        }
+        if !mode_forces_bot(&inner, &f) && !is_bot_seat(&inner, &f, seat) {
             return false;
         }
         let seq = inner.table.seq();
@@ -371,7 +385,7 @@ async fn act_once(room: &Room) -> bool {
     let trick_pause = event["trick_winner"].is_string();
     // A bot action can end the board (last card, or the 4th pass of a
     // passed-out deal): broadcast the result like a human action would.
-    let complete = inner.table.board_result_json().map(|result| {
+    let complete = inner.result_json().map(|result| {
         let mut ev = json!({
             "t": "event",
             "table_id": room.id,

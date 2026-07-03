@@ -276,11 +276,13 @@ impl TableState {
     /// along" mentally instead of watching the hand unfold card by card,
     /// and with a bot declarer the human dummy actually plays the hand
     /// (see rooms::declarer_side_controller) so they must see it.
-    pub fn snapshot(&self, viewer_seat: Option<Direction>, see_all: bool) -> Value {
+    /// `bid_only` treats a contract-reached board as complete (bid-only
+    /// boards end at the contract, with all hands revealed for discussion).
+    pub fn snapshot(&self, viewer_seat: Option<Direction>, see_all: bool, bid_only: bool) -> Value {
         let f = self.fold();
         let dummy = f.contract.as_ref().map(|c| c.dummy());
         let declarer = f.contract.as_ref().map(|c| c.declarer);
-        let complete = f.phase == Phase::Complete;
+        let complete = f.phase == Phase::Complete || (bid_only && f.phase == Phase::Play);
 
         let mut hands = serde_json::Map::new();
         for seat in Direction::ALL {
@@ -313,12 +315,12 @@ impl TableState {
             }
             // Declarer also sees dummy's legal cards (declarer plays dummy).
             (Phase::Play, Some(seat))
-                if see_all
-                    || viewer_seat == Some(seat)
-                    || (f
-                        .contract
-                        .as_ref()
-                        .is_some_and(|c| viewer_seat == Some(c.declarer) && seat == c.dummy())) =>
+                if !complete
+                    && (see_all
+                        || viewer_seat == Some(seat)
+                        || (f.contract.as_ref().is_some_and(|c| {
+                            viewer_seat == Some(c.declarer) && seat == c.dummy()
+                        }))) =>
             {
                 let lead_suit = current_lead_suit(&f);
                 let legal = play::legal_cards(&self.remaining(seat, &f), lead_suit)
@@ -337,10 +339,14 @@ impl TableState {
                 "dealer": self.board.dealer.to_char().to_string(),
                 "vulnerable": self.board.vulnerable.to_pbn(),
             },
-            "phase": match f.phase {
-                Phase::Bidding => "bidding",
-                Phase::Play => "play",
-                Phase::Complete => "complete",
+            "phase": if complete {
+                "complete"
+            } else {
+                match f.phase {
+                    Phase::Bidding => "bidding",
+                    Phase::Play => "play",
+                    Phase::Complete => "complete",
+                }
             },
             "auction": f.calls.iter().map(|c| c.to_pbn()).collect::<Vec<_>>(),
             "contract": f.contract.as_ref().map(|c| json!({
@@ -561,14 +567,14 @@ mod tests {
         let mut t = setup();
         apply_calls(&mut t, &[(North, "1S")]);
 
-        let snap = t.snapshot(Some(South), false);
+        let snap = t.snapshot(Some(South), false, false);
         assert_eq!(snap["hands"]["S"]["visible"], true);
         assert_eq!(snap["hands"]["N"]["visible"], false);
         assert_eq!(snap["hands"]["N"]["count"], 13);
         assert!(snap["hands"]["N"]["cards"].is_null());
 
         // Teacher sees everything.
-        let snap = t.snapshot(None, true);
+        let snap = t.snapshot(None, true, false);
         assert_eq!(snap["hands"]["N"]["visible"], true);
         assert_eq!(snap["hands"]["W"]["visible"], true);
     }
@@ -589,7 +595,7 @@ mod tests {
             ],
         );
 
-        let snap = t.snapshot(Some(South), false);
+        let snap = t.snapshot(Some(South), false, false);
         assert_eq!(snap["phase"], "complete");
         for seat in ["N", "E", "S", "W"] {
             assert_eq!(snap["hands"][seat]["visible"], true, "seat {seat}");
@@ -597,7 +603,7 @@ mod tests {
         }
 
         // Kibitzer too.
-        let snap = t.snapshot(None, false);
+        let snap = t.snapshot(None, false, false);
         assert_eq!(snap["hands"]["N"]["visible"], true);
         assert_eq!(snap["hands"]["N"]["cards"].as_array().unwrap().len(), 13);
     }
@@ -618,7 +624,7 @@ mod tests {
             ],
         );
         // Dummy is West (declarer East). Before the lead, West is hidden to N.
-        let snap = t.snapshot(Some(North), false);
+        let snap = t.snapshot(Some(North), false, false);
         assert_eq!(snap["hands"]["W"]["visible"], false);
 
         let s2 = Card::new(Suit::Spades, bridge_types::Rank::Two);
@@ -627,7 +633,7 @@ mod tests {
             card: s2,
         })
         .unwrap();
-        let snap = t.snapshot(Some(North), false);
+        let snap = t.snapshot(Some(North), false, false);
         assert_eq!(snap["hands"]["W"]["visible"], true);
     }
 
@@ -646,11 +652,11 @@ mod tests {
                 (South, "Pass"),
             ],
         );
-        let snap = t.snapshot(Some(South), false);
+        let snap = t.snapshot(Some(South), false, false);
         assert_eq!(snap["legal"]["kind"], "card");
         assert_eq!(snap["legal"]["cards"].as_array().unwrap().len(), 13);
 
-        let snap = t.snapshot(Some(North), false);
+        let snap = t.snapshot(Some(North), false, false);
         assert!(snap["legal"].is_null());
     }
 }

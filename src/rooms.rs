@@ -87,6 +87,40 @@ impl BotMode {
     }
 }
 
+/// How a board runs (Rick 2026-07-02, deal-source requirements): full
+/// bridge, auction-only drills, or cardplay-only drills. Sticky per room,
+/// set via the `deal` message's optional `mode`; demo-room only for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoardMode {
+    #[default]
+    BidAndPlay,
+    /// Board completes at the final contract; all hands revealed for
+    /// discussion. No cardplay (bots don't act, plays are rejected).
+    BidOnly,
+    /// The auction is automatic: BBA bids EVERY seat (humans included,
+    /// silently); play starts at the resulting contract.
+    PlayOnly,
+}
+
+impl BoardMode {
+    pub fn parse(s: &str) -> Option<BoardMode> {
+        match s {
+            "bid-and-play" => Some(BoardMode::BidAndPlay),
+            "bid-only" => Some(BoardMode::BidOnly),
+            "play-only" => Some(BoardMode::PlayOnly),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BoardMode::BidAndPlay => "bid-and-play",
+            BoardMode::BidOnly => "bid-only",
+            BoardMode::PlayOnly => "play-only",
+        }
+    }
+}
+
 /// A seated (or recently seated) occupant.
 #[derive(Debug, Clone)]
 pub struct Occupant {
@@ -133,6 +167,8 @@ pub struct RoomInner {
     /// Seats that sent `ready_next_board` for the current board. Cleared on
     /// advance and when a seat's occupant changes.
     pub ready: HashSet<Direction>,
+    /// How boards run at this table (see `BoardMode`).
+    pub board_mode: BoardMode,
 }
 
 impl Room {
@@ -145,6 +181,7 @@ impl Room {
                 seats: HashMap::new(),
                 board_index: 0,
                 ready: HashSet::new(),
+                board_mode: BoardMode::default(),
             }),
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
@@ -293,6 +330,27 @@ impl RoomInner {
             return dummy;
         }
         declarer
+    }
+
+    /// Mode-aware board result: on a bid-only board the board is complete
+    /// as soon as the auction lands on a contract (no tricks to report);
+    /// everything else defers to the table's own result.
+    pub fn result_json(&self) -> Option<serde_json::Value> {
+        if self.board_mode == BoardMode::BidOnly {
+            let f = self.table.fold();
+            if f.phase == crate::table::Phase::Play {
+                let c = f.contract.as_ref().expect("play phase has a contract");
+                return Some(serde_json::json!({
+                    "passed_out": false,
+                    "bid_only": true,
+                    "contract": {
+                        "text": c.to_pbn(),
+                        "declarer": c.declarer.to_char().to_string(),
+                    },
+                }));
+            }
+        }
+        self.table.board_result_json()
     }
 
     pub fn seat_bot_controlled(&self, seat: Direction, on_turn: bool, now: Instant) -> bool {
@@ -538,6 +596,7 @@ mod tests {
             seats: HashMap::new(),
             board_index: 0,
             ready: HashSet::new(),
+            board_mode: BoardMode::default(),
         };
         assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
         assert_eq!(inner.seat_or_rebind("u2", "Bob"), Some(Direction::West));
@@ -555,6 +614,7 @@ mod tests {
             seats: HashMap::new(),
             board_index: 0,
             ready: HashSet::new(),
+            board_mode: BoardMode::default(),
         };
         for sub in subs {
             inner.seat_or_rebind(sub, sub);
@@ -577,6 +637,36 @@ mod tests {
         // Both bot: the bot declarer drives.
         inner.seats.remove(&North);
         assert_eq!(inner.declarer_side_controller(South, true, now), South);
+    }
+
+    #[test]
+    fn bid_only_board_completes_at_the_contract() {
+        use crate::table::Action;
+        use Direction::*;
+        let mut inner = inner_with(&[]);
+        inner.board_mode = BoardMode::BidOnly;
+        assert!(inner.result_json().is_none(), "auction in progress");
+        // Demo board, dealer N: 1S - P - P - P.
+        for (seat, call) in [
+            (North, Call::from_pbn("1S").unwrap()),
+            (East, Call::Pass),
+            (South, Call::Pass),
+            (West, Call::Pass),
+        ] {
+            inner.table.apply(Action::Call { seat, call }).unwrap();
+        }
+        let r = inner.result_json().expect("contract reached = complete");
+        assert_eq!(r["bid_only"], true);
+        assert_eq!(r["contract"]["text"], "1S");
+        assert_eq!(r["contract"]["declarer"], "N");
+
+        // The snapshot presents the board as complete with every hand
+        // revealed (discussion view).
+        let snap = inner.table.snapshot(Some(South), false, true);
+        assert_eq!(snap["phase"], "complete");
+        for seat in ["N", "E", "S", "W"] {
+            assert_eq!(snap["hands"][seat]["visible"], true, "seat {seat}");
+        }
     }
 
     #[test]
