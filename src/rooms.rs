@@ -36,20 +36,23 @@ pub const TAKEOVER_AFTER_ON_TURN: Duration = Duration::from_secs(20);
 /// up for everyone).
 pub const RESYNC: &str = "__resync__";
 
-/// Which backend drives the room's bot seats. Real is the default; the
-/// others are set via `"bot":"random"` / `"bot":"rules"` in a hello frame
-/// and are sticky for the room's lifetime.
+/// Which backend drives the room's bot seats. **Rules is the default**
+/// (instant rulebot cardplay — BEN's cold opening lead was ~57s in the
+/// field, Rick 2026-07-03); the others are set via `"bot":"real"` /
+/// `"bot":"random"` / `"bot":"slow"` in a hello frame (or `?bot=` on the
+/// table URL) and are sticky for the room's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum BotMode {
     /// BBA bidding + BEN cardplay, with bridge-rulebot as the cardplay
-    /// fallback (Pass for bidding).
-    #[default]
+    /// fallback (Pass for bidding). Opt-in via `bot:real` — BEN is slow
+    /// (~10-60s cold), so only when you specifically want its cardplay.
     Real = 0,
     /// Instant deterministic RandomLegal cardplay, Pass bidding. Testing.
     Random = 1,
-    /// BBA bidding + instant rule-based cardplay (bridge-rulebot) — watch
-    /// the rulebot defend real contracts without BEN in the loop.
+    /// BBA bidding + instant rule-based cardplay (bridge-rulebot) — real
+    /// contracts defended without BEN in the loop. **Default.**
+    #[default]
     Rules = 2,
     /// Rules mode with human-mimicking pacing: N/S play each card after a
     /// random 3-10s think, E/W stay fast. For teacher-console testing —
@@ -60,6 +63,7 @@ pub enum BotMode {
 impl BotMode {
     pub fn parse(s: &str) -> Option<BotMode> {
         match s {
+            "real" => Some(BotMode::Real),
             "random" => Some(BotMode::Random),
             "rules" => Some(BotMode::Rules),
             "slow" => Some(BotMode::Slow),
@@ -186,7 +190,7 @@ impl Room {
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
             keepalive_running: std::sync::atomic::AtomicBool::new(false),
-            bot_mode_raw: std::sync::atomic::AtomicU8::new(BotMode::Real as u8),
+            bot_mode_raw: std::sync::atomic::AtomicU8::new(BotMode::Rules as u8),
             bba_cache: Mutex::new(None),
             session,
         })

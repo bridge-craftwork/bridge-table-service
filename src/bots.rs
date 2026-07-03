@@ -6,7 +6,9 @@
 //! reconnects. One exception: a human declarer plays the dummy's cards, so
 //! the dummy seat is driven by whoever controls the declarer seat, not a
 //! bot. This mirrors the frontend's pluggable-bot design (`cardplayBots.js`):
-//! bidding is BBA (prefix-cached, see `bba`), cardplay is BEN (see `ben`),
+//! bidding is BBA (prefix-cached, see `bba`); cardplay defaults to the instant
+//! rule-based `bridge-rulebot` (BotMode::Rules), BEN (see `ben`) opt-in via
+//! `bot:real`;
 //! and every suggestion is validated through the engine with `RandomLegal`
 //! (Pass, for bidding) as the always-available fallback — a slow or wrong
 //! bot can never freeze or corrupt a table.
