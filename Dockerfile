@@ -2,26 +2,20 @@
 
 # ---- builder ----
 FROM rust:1-bookworm AS builder
-WORKDIR /workspace
+WORKDIR /app
 
-# Sibling crates injected via buildx `--build-context` (see justfile and
-# ci.yml). The container layout mirrors a developer Mac — siblings live
-# as sister directories of the service — so [patch] paths in Cargo.toml
-# resolve identically in both environments (`path = "../bridge-types"`
-# works for native cargo and for this build).
-COPY --from=bridge-types . ./bridge-types/
-COPY --from=bridge-encodings . ./bridge-encodings/
-COPY --from=bridge-rulebot . ./bridge-rulebot/
+# Internal bridge crates (bridge-types, bridge-encodings, bridge-rulebot)
+# are git dependencies pinned by Cargo.lock; cargo fetches them from GitHub
+# during the build. No sibling checkouts or build-contexts required — the
+# image always builds pushed, pinned revisions.
 
-# Cache deps separately from source. Service goes in a bridge-table-service
-# subdirectory so siblings can reference its parent (../<sibling>).
-COPY Cargo.toml Cargo.lock ./bridge-table-service/
-WORKDIR /workspace/bridge-table-service
+# Cache deps separately from source.
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release && \
     rm -rf src target/release/deps/bridge_table_service*
 
-# Real service source last so service-only edits leave sibling layers cached.
+# Real service source last so service-only edits leave dep layers cached.
 COPY src/ ./src/
 COPY wwwroot/ ./wwwroot/
 RUN cargo build --release
@@ -45,8 +39,8 @@ RUN apt-get update \
 USER service
 WORKDIR /app
 
-COPY --from=builder /workspace/bridge-table-service/target/release/bridge-table-service /app/bridge-table-service
-COPY --from=builder /workspace/bridge-table-service/wwwroot /app/wwwroot
+COPY --from=builder /app/target/release/bridge-table-service /app/bridge-table-service
+COPY --from=builder /app/wwwroot /app/wwwroot
 
 ENV PORT=8004
 ENV DATABASE_PATH=/data/bridge-table-service.db

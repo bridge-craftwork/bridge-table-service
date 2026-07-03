@@ -18,11 +18,11 @@ Rust testing happens directly in cargo on the host — no container needed:
 
 ```sh
 cp .env.example .env             # then edit
-just dev                          # cargo run, listens on localhost:8004
-cargo test
+just dev                          # runs the service on localhost:8004
+just test                         # cargo test against local sibling checkouts
 ```
 
-Sibling crates are expected as sister directories (`../bridge-types`, `../bridge-encodings`, `../bridge-rulebot`) via the `[patch]` entries in `Cargo.toml` — see "Sibling crate path-deps" below.
+The internal bridge crates (`bridge-types`, `bridge-encodings`, `bridge-rulebot`) are git dependencies pinned by `Cargo.lock`. For local development against sister-directory checkouts (`../bridge-types` etc.), gitignored `[patch]` overrides live in `.cargo/config.toml` and take effect through `./dev-build.sh` (which `just dev` / `just test` use) — see "Local development against sibling crates" below.
 
 > **About the `justfile`:** it's organized into three audience-scoped sections. *Universal* recipes (`dev`, `test`, `check`, `release`) work on any platform. *Apple Silicon Mac* recipes (`build`, `push`) drive a Colima/Rosetta cross-build pipeline for the maintainer's amd64 droplet. *Maintainer droplet* recipes (`deploy`, `logs`, `shell`, …) ssh to a local SSH alias (`bridge-droplet`) defined in the maintainer's personal `~/.ssh/config`. If you're forking this service, you can ignore sections 2 and 3 — `docker build .` works directly, [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is platform-agnostic and produces images on GitHub's amd64 runners.
 
@@ -76,10 +76,10 @@ Bot seats use BBA for bidding (with a per-room predicted-auction prefix cache; d
 
 [`bridge-rulebot`](https://github.com/bridge-craftwork/bridge-rulebot) (sibling crate) is the cardplay fallback and the `"bot":"rules"` backend: a deterministic rule-based player (opening leads, second/third-hand play, defensive signals) whose every decision carries a reason code — see that repo's `docs/requirements.md`. Each decision is logged as a `rulebot_decision` event with its rule slug and duration.
 
-## Sibling crate path-deps
+## Local development against sibling crates
 
-This service depends on `bridge-types`, `bridge-encodings`, and `bridge-rulebot` as sibling repos via the buildx multi-context pattern. The container layout mirrors the developer-Mac layout — siblings live as sister directories of the service — so a single `[patch]` path works in both native cargo and inside Docker.
+This service depends on `bridge-types`, `bridge-encodings`, and `bridge-rulebot` as git dependencies pinned by the committed `Cargo.lock`; Docker and CI always build those pinned, pushed revisions (no sibling checkouts or build-contexts). For local iteration against sister-directory checkouts, gitignored `[patch]` overrides in `.cargo/config.toml` redirect them to `../<sibling>` — but only through `./dev-build.sh` (see CLAUDE.md): bare cargo either ignores the patches or silently rewrites `Cargo.lock` with local paths that must never be committed. To pick up local sibling changes in a container image, push the sibling first and run `cargo update -p <crate>` via `./dev-build.sh --ci` to re-pin.
 
-The wiring lives in four places (already done for both siblings): `Cargo.toml` (`[patch]` entries), `justfile` (`SIBLING_CONTEXTS`), `Dockerfile` (`COPY --from=` lines), and `.github/workflows/ci.yml` (checkout steps in both jobs + `build-contexts:`).
+When you add a new internal crate: add the git dependency in `Cargo.toml` and a matching `[patch]` entry in `.cargo/config.toml`. Nothing in the `Dockerfile`, `justfile`, or CI needs to change.
 
 Use [`record_event()`](src/observability/events.rs) for any domain-significant event — it writes to the SQLite `events` table *and* emits a JSON log line, so it shows up in both the dashboard and ops tooling.

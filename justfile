@@ -26,18 +26,21 @@ default:
 # 1. UNIVERSAL
 # =============================================================================
 
-# Run locally without docker (fastest iteration loop).
+# Run locally without docker (fastest iteration loop). Goes through
+# dev-build.sh so the gitignored local-checkout patches in
+# .cargo/config.toml take effect without dirtying the committed Cargo.lock
+# (see CLAUDE.md).
 dev:
-    cargo run
+    ./dev-build.sh run
 
-# Run cargo tests.
+# Run cargo tests against local sibling checkouts.
 test:
-    cargo test
+    ./dev-build.sh test
 
-# Format and lint.
+# Format and lint (CI parity: patches disabled, committed lock's git pins).
 check:
     cargo fmt --check
-    cargo clippy -- -D warnings
+    ./dev-build.sh --ci clippy -- -D warnings
 
 # Tag and push a release. CI builds and pushes the versioned image.
 release VERSION:
@@ -53,17 +56,6 @@ release VERSION:
 # amd64 cross-builds. On other platforms, build via `docker build .`
 # directly (native architecture), or push to GitHub and let CI build.
 # =============================================================================
-
-# Sibling crate path-deps. Each entry is one --build-context flag for
-# buildx; the value `../<name>` matches the developer-Mac layout (sibling
-# repos as sister directories) and the in-container layout the Dockerfile
-# expects. Empty if the service has no sibling path-deps.
-#
-# When you add a sibling here, also:
-#   - add a [patch] entry in Cargo.toml,
-#   - add a COPY line in the Dockerfile,
-#   - add a checkout step + build-contexts entry in .github/workflows/ci.yml.
-SIBLING_CONTEXTS := "--build-context bridge-types=../bridge-types --build-context bridge-encodings=../bridge-encodings --build-context bridge-rulebot=../bridge-rulebot"
 
 # Ensure colima is running (no-op if already up).
 _colima-up:
@@ -86,7 +78,7 @@ _colima-up:
 #
 # Prereq: `colima start --vz-rosetta` (one-time; persists across reboots).
 build: _colima-up
-    docker buildx --builder colima build {{SIBLING_CONTEXTS}} --platform linux/amd64 -t {{IMAGE}}:dev --load .
+    docker buildx --builder colima build --platform linux/amd64 -t {{IMAGE}}:dev --load .
 
 # Push the dev image to ghcr.io.
 push: build
