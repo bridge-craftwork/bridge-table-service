@@ -18,7 +18,10 @@
 //!                    runtime deal source + lockstep board nav (§Phase 3.1):
 //!                    {"t":"load_boards","boards_pbn":"…","label":"…"} |
 //!                    {"t":"goto_board","index":N} (1-based) |
-//!                    {"t":"next_board"} | {"t":"prev_board"}
+//!                    {"t":"next_board"} | {"t":"prev_board"} |
+//!                    dynamic tables + lobby (§Phase 3.2):
+//!                    {"t":"seat_students"} | {"t":"wait_to_seat","on":bool} |
+//!                    {"t":"add_tables","count":N}
 //!   server → client: {"t":"welcome"…} then {"t":"snapshot"…} on join,
 //!                    after any undo/board change, and after the opening
 //!                    lead; {"t":"event"…} per action; {"t":"lobby"…}
@@ -167,7 +170,7 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
 async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Session>, hello: Hello) {
     let ticket = hello.ticket;
     let placement = session.place(&ticket.sub, &ticket.name).await;
-    let mut room: Arc<Room> = session.rooms[placement.room_idx].clone();
+    let mut room: Arc<Room> = placement.room;
     let mut seat = placement.seat;
 
     if let Some(mode) = hello.bot_override {
@@ -344,8 +347,7 @@ async fn resolve_binding(
     room_events: &mut tokio::sync::broadcast::Receiver<String>,
 ) -> Rebind {
     match session.find_seated(&ticket.sub).await {
-        Some((idx, s)) => {
-            let target = &session.rooms[idx];
+        Some((target, s)) => {
             if target.id == room.id && *seat == Some(s) {
                 return Rebind::Unchanged;
             }
@@ -359,16 +361,11 @@ async fn resolve_binding(
         }
         None => {
             if seat.is_none() {
-                return Rebind::Unchanged; // still the same kibitzer
+                return Rebind::Unchanged; // still the same lobby member
             }
-            // Booted: watch the table we were removed from.
+            // Booted: assign_seat already parked us in the lobby watching this
+            // table; just drop our seat view (keep the current room).
             *seat = None;
-            let idx = session
-                .rooms
-                .iter()
-                .position(|r| r.id == room.id)
-                .unwrap_or(0);
-            session.add_kibitzer(&ticket.sub, &ticket.name, idx).await;
             Rebind::Changed
         }
     }
@@ -386,7 +383,7 @@ async fn handle_teacher(
 ) {
     let ticket = hello.ticket;
     if let Some(mode) = hello.bot_override {
-        for room in &session.rooms {
+        for room in session.rooms_snapshot().await {
             room.set_bot_mode(mode);
         }
         tracing::info!(event = "bot_mode_set", mode = mode.as_str(), session = %session.id, sub = %ticket.sub, "");
@@ -409,7 +406,7 @@ async fn handle_teacher(
         json!({ "sub": ticket.sub, "role": "teacher", "session": session.id }),
     )
     .await;
-    for room in &session.rooms {
+    for room in session.rooms_snapshot().await {
         crate::bots::ensure_keepalive(room.clone());
     }
 
@@ -486,7 +483,7 @@ async fn handle_teacher(
                             let _ = tx.send(Message::Text(err_msg("bad_table", "kibitz.table missing"))).await;
                             continue;
                         };
-                        let Some(target) = session.room_by_id(table_id) else {
+                        let Some(target) = session.room_by_id(table_id).await else {
                             let _ = tx.send(Message::Text(err_msg("bad_table", "unknown table"))).await;
                             continue;
                         };
@@ -542,7 +539,8 @@ async fn handle_teacher_msg(
             let total = session.deck_status().await.2;
             // Tell every table (players see "next board available"), then
             // move any table whose humans are already all ready.
-            for room in &session.rooms {
+            let rooms = session.rooms_snapshot().await;
+            for room in &rooms {
                 room.broadcast(
                     json!({
                         "t": "event",
@@ -554,7 +552,7 @@ async fn handle_teacher_msg(
                     .to_string(),
                 );
             }
-            for room in &session.rooms {
+            for room in &rooms {
                 session.try_advance(room, false).await;
             }
             session.notify_lobby();
@@ -601,14 +599,40 @@ async fn handle_teacher_msg(
             None
         }
         Some("force_advance") => {
-            let Some(room) = v["table"].as_str().and_then(|id| session.room_by_id(id)) else {
+            let room = match v["table"].as_str() {
+                Some(id) => session.room_by_id(id).await,
+                None => None,
+            };
+            let Some(room) = room else {
                 return Some(err_msg("bad_table", "force_advance.table unknown"));
             };
-            if session.try_advance(room, true).await {
+            if session.try_advance(&room, true).await {
                 None
             } else {
                 Some(err_msg("rejected", "no more boards"))
             }
+        }
+        // ---- Dynamic tables + lobby (roadmap §Phase 3.2) ----
+        Some("seat_students") => {
+            for room in session.seat_students().await {
+                let inner = room.state.lock().await;
+                let ev = seats_event(&room, &inner);
+                drop(inner);
+                room.broadcast(ev);
+                crate::bots::kick(room.clone());
+            }
+            session.notify_recheck();
+            session.notify_lobby();
+            None
+        }
+        Some("wait_to_seat") => {
+            session.set_wait_to_seat(v["on"].as_bool().unwrap_or(false));
+            None
+        }
+        Some("add_tables") => {
+            let count = v["count"].as_u64().unwrap_or(1).clamp(1, 20) as usize;
+            session.add_tables(count).await;
+            None
         }
         Some("assign_seat") | Some("boot") => {
             let Some(table_id) = v["table"].as_str() else {
@@ -629,10 +653,9 @@ async fn handle_teacher_msg(
             };
             match session.assign_seat(table_id, seat, sub).await {
                 Ok(changed) => {
-                    for idx in changed {
-                        let room = &session.rooms[idx];
+                    for room in changed {
                         let inner = room.state.lock().await;
-                        let ev = seats_event(room, &inner);
+                        let ev = seats_event(&room, &inner);
                         drop(inner);
                         room.broadcast(ev);
                         // A vacated seat is a bot now; a filled one may

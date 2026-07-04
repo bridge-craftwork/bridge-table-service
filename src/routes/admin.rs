@@ -90,10 +90,12 @@ async fn create_session(
     if req.id == "demo" {
         return err(StatusCode::BAD_REQUEST, "'demo' is reserved");
     }
-    if !(1..=MAX_TABLES).contains(&req.table_count) {
+    // 0 is allowed: a session can start with no tables (student-fill /
+    // add_tables create them later — roadmap §Phase 3.2).
+    if req.table_count > MAX_TABLES {
         return err(
             StatusCode::BAD_REQUEST,
-            format!("table_count must be 1..={MAX_TABLES}"),
+            format!("table_count must be 0..={MAX_TABLES}"),
         );
     }
     let kind = match SessionKind::parse(&req.kind) {
@@ -160,7 +162,7 @@ async fn create_session(
             "ok": true,
             "id": session.id,
             "created": created,
-            "tables": session.rooms.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            "tables": session.rooms_snapshot().await.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             "boards": session.deck_status().await.2,
         })),
     )
@@ -184,7 +186,7 @@ async fn delete_session(
             .into_response();
     };
     // Tell everyone at the tables; connections hang up on this event.
-    for room in &session.rooms {
+    for room in session.rooms_snapshot().await {
         room.broadcast(
             json!({
                 "t": "event",
