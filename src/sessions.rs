@@ -258,7 +258,7 @@ impl Session {
         let seed = boards
             .first()
             .cloned()
-            .unwrap_or_else(|| crate::rooms::random_board(1));
+            .unwrap_or_else(crate::rooms::placeholder_board);
         let (notify, _) = broadcast::channel(64);
         Arc::new_cyclic(|weak: &Weak<Session>| {
             let rooms = (1..=table_count)

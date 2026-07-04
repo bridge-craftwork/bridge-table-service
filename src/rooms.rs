@@ -533,6 +533,22 @@ fn rotate_board_one(b: BoardSetup) -> BoardSetup {
     }
 }
 
+/// A deliberately fake "no deal loaded" placeholder: each seat holds one full
+/// suit (N=♠, E=♥, S=♦, W=♣) so it reads as an obvious placeholder, not a real
+/// hand, if it ever shows through the client's waiting overlay (Rick
+/// 2026-07-04). Board 0 = the not-a-real-board sentinel.
+pub fn placeholder_board() -> BoardSetup {
+    let pbn = "[Board \"0\"]\n[Dealer \"N\"]\n[Vulnerable \"None\"]\n[Deal \"N:AKQJT98765432... .AKQJT98765432.. ..AKQJT98765432. ...AKQJT98765432\"]\n";
+    let boards = bridge_encodings::pbn::read_pbn(pbn).expect("placeholder PBN parses");
+    let b = &boards[0];
+    BoardSetup {
+        number: b.number.unwrap_or(0),
+        dealer: b.dealer.unwrap_or(Direction::North),
+        vulnerable: b.vulnerable,
+        deal: b.deal.clone(),
+    }
+}
+
 /// Board 1 of the PBN spec's example deal — a fixed, valid deal so the demo
 /// table is deterministic.
 fn demo_board() -> BoardSetup {
