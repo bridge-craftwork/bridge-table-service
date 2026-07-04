@@ -924,7 +924,10 @@ mod tests {
         // (it's teacher-driven lockstep).
         room.state.lock().await.ready.insert(South);
         assert_eq!(s.open_boards_to(2).await, 2);
-        assert!(!s.try_advance(&room, false).await, "teacher_set is lockstep");
+        assert!(
+            !s.try_advance(&room, false).await,
+            "teacher_set is lockstep"
+        );
 
         // The teacher drives EVERY table together with next_board.
         assert_eq!(s.next_board().await, 2, "1-based board number");
@@ -1016,14 +1019,7 @@ mod tests {
         assert!(!s.loaded().await);
         // Placeholder board keeps TableState valid pre-load (seating works).
         assert_eq!(
-            s.rooms[0]
-                .state
-                .lock()
-                .await
-                .table
-                .board
-                .deal
-                .total_cards(),
+            s.rooms[0].state.lock().await.table.board.deal.total_cards(),
             52
         );
         // No set → nothing advances, even forced.
