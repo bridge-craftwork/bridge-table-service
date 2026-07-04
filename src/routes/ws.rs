@@ -21,7 +21,11 @@
 //!                    {"t":"next_board"} | {"t":"prev_board"} |
 //!                    dynamic tables + lobby (§Phase 3.2):
 //!                    {"t":"seat_students"} | {"t":"wait_to_seat","on":bool} |
-//!                    {"t":"add_tables","count":N}
+//!                    {"t":"add_tables","count":N} |
+//!                    {"t":"set_seat_policy","policy":"first_free|one_per_south|
+//!                        two_per_ns|pairs_ns|manual"} |
+//!                    {"t":"set_bot_mode","mode":"rules|real|random|slow"} |
+//!                    {"t":"pause_bots","on":bool}
 //!   server → client: {"t":"welcome"…} then {"t":"snapshot"…} on join,
 //!                    after any undo/board change, and after the opening
 //!                    lead; {"t":"event"…} per action; {"t":"lobby"…}
@@ -383,9 +387,8 @@ async fn handle_teacher(
 ) {
     let ticket = hello.ticket;
     if let Some(mode) = hello.bot_override {
-        for room in session.rooms_snapshot().await {
-            room.set_bot_mode(mode);
-        }
+        // Session-level so every table (and future ones) uses it.
+        session.set_bot_mode(mode).await;
         tracing::info!(event = "bot_mode_set", mode = mode.as_str(), session = %session.id, sub = %ticket.sub, "");
     }
 
@@ -632,6 +635,29 @@ async fn handle_teacher_msg(
         Some("add_tables") => {
             let count = v["count"].as_u64().unwrap_or(1).clamp(1, 20) as usize;
             session.add_tables(count).await;
+            None
+        }
+        Some("set_seat_policy") => {
+            let Some(policy) = v["policy"]
+                .as_str()
+                .and_then(crate::sessions::SeatPolicy::from_key)
+            else {
+                return Some(err_msg("bad_policy", "unknown seat policy"));
+            };
+            session.set_seat_policy(policy);
+            None
+        }
+        Some("set_bot_mode") => {
+            let Some(mode) = v["mode"].as_str().and_then(crate::rooms::BotMode::parse) else {
+                return Some(err_msg("bad_mode", "unknown bot mode"));
+            };
+            session.set_bot_mode(mode).await;
+            None
+        }
+        Some("pause_bots") => {
+            session
+                .set_bots_paused(v["on"].as_bool().unwrap_or(true))
+                .await;
             None
         }
         Some("assign_seat") | Some("boot") => {

@@ -151,6 +151,32 @@ impl SeatPolicy {
             other => Err(format!("unknown seat mode '{other}'")),
         }
     }
+
+    /// Short key ↔ policy for the console dropdown (a curated subset of the
+    /// full JSON policy space).
+    pub fn from_key(key: &str) -> Option<SeatPolicy> {
+        use Direction::{North, South};
+        match key {
+            "first_free" => Some(SeatPolicy::FirstFree),
+            "one_per_south" => Some(SeatPolicy::OnePerSeat(vec![South])),
+            "two_per_ns" => Some(SeatPolicy::OnePerSeat(vec![South, North])),
+            "pairs_ns" => Some(SeatPolicy::Pairs(vec![Side::NS])),
+            "manual" => Some(SeatPolicy::Manual),
+            _ => None,
+        }
+    }
+
+    pub fn key(&self) -> &'static str {
+        use Direction::{North, South};
+        match self {
+            SeatPolicy::FirstFree => "first_free",
+            SeatPolicy::Manual => "manual",
+            SeatPolicy::OnePerSeat(s) if s.as_slice() == [South] => "one_per_south",
+            SeatPolicy::OnePerSeat(s) if s.as_slice() == [South, North] => "two_per_ns",
+            SeatPolicy::Pairs(s) if s.as_slice() == [Side::NS] => "pairs_ns",
+            _ => "custom",
+        }
+    }
 }
 
 /// Parse raw PBN text into the session's ordered board list.
@@ -224,7 +250,17 @@ pub struct Session {
     pub id: String,
     pub kind: SessionKind,
     pub owner_sub: String,
-    pub seat_policy: SeatPolicy,
+    /// Auto-seat shape, live-settable from the console (`set_seat_policy`).
+    /// Read via `seat_policy()` (cheap clone; never held across an await).
+    seat_policy: std::sync::Mutex<SeatPolicy>,
+    /// Serializes placement so simultaneous arrivals fill deterministically
+    /// (without it, concurrent tabs race to create tables / grab seats).
+    seating: Mutex<()>,
+    /// Session-default bot backend (`BotMode as u8`); new tables inherit it,
+    /// `set_bot_mode` applies it to all. Surfaced on the console.
+    bot_mode: std::sync::atomic::AtomicU8,
+    /// Teacher pause: bots stop acting until resumed (Shark "Stop play").
+    bots_paused: std::sync::atomic::AtomicBool,
     /// The loaded set + label + lockstep pointer. Swappable at runtime
     /// (`load_boards`); empty = idle. Never held across a room lock.
     pub deck: Mutex<Deck>,
@@ -290,7 +326,10 @@ impl Session {
                 id,
                 kind,
                 owner_sub,
-                seat_policy,
+                seat_policy: std::sync::Mutex::new(seat_policy),
+                seating: Mutex::new(()),
+                bot_mode: std::sync::atomic::AtomicU8::new(crate::rooms::BotMode::default() as u8),
+                bots_paused: std::sync::atomic::AtomicBool::new(false),
                 deck: Mutex::new(Deck {
                     boards: Arc::new(boards),
                     label: None,
@@ -352,9 +391,13 @@ impl Session {
             board,
             Some(self.weak_self.clone()),
         );
+        // New tables inherit the session's bot backend + pause state.
+        room.set_bot_mode(self.bot_mode());
         self.rooms.write().await.push(room.clone());
         crate::bots::ensure_keepalive(room.clone());
-        crate::bots::kick(room.clone());
+        if !self.bots_paused() {
+            crate::bots::kick(room.clone());
+        }
         self.notify_lobby();
         room
     }
@@ -371,6 +414,43 @@ impl Session {
     /// Zoom-style waiting room toggle.
     pub fn set_wait_to_seat(&self, on: bool) {
         self.wait_to_seat.store(on, Ordering::SeqCst);
+        self.notify_lobby();
+    }
+
+    // ── Live console settings: seat policy + bot controls (Phase 3.2) ────────
+    pub fn seat_policy(&self) -> SeatPolicy {
+        self.seat_policy.lock().unwrap().clone()
+    }
+    pub fn set_seat_policy(&self, p: SeatPolicy) {
+        *self.seat_policy.lock().unwrap() = p;
+        self.notify_lobby();
+    }
+    pub fn bot_mode(&self) -> crate::rooms::BotMode {
+        crate::rooms::BotMode::from_u8(self.bot_mode.load(Ordering::SeqCst))
+    }
+    /// Change the bot backend for every table (and future ones).
+    pub async fn set_bot_mode(&self, mode: crate::rooms::BotMode) {
+        self.bot_mode.store(mode as u8, Ordering::SeqCst);
+        for room in self.rooms_snapshot().await {
+            room.set_bot_mode(mode);
+            if !self.bots_paused() {
+                crate::bots::kick(room);
+            }
+        }
+        self.notify_lobby();
+    }
+    pub fn bots_paused(&self) -> bool {
+        self.bots_paused.load(Ordering::SeqCst)
+    }
+    /// Pause/resume bot play across all tables (Shark "Stop play"). Resume
+    /// re-kicks every table so play continues.
+    pub async fn set_bots_paused(&self, on: bool) {
+        self.bots_paused.store(on, Ordering::SeqCst);
+        if !on {
+            for room in self.rooms_snapshot().await {
+                crate::bots::kick(room);
+            }
+        }
         self.notify_lobby();
     }
 
@@ -398,9 +478,9 @@ impl Session {
     /// The shape used for bulk/auto seating. Manual has no auto shape → treat
     /// it as FirstFree when the teacher explicitly seats the lobby.
     fn bulk_shape(&self) -> SeatPolicy {
-        match &self.seat_policy {
+        match self.seat_policy() {
             SeatPolicy::Manual => SeatPolicy::FirstFree,
-            other => other.clone(),
+            other => other,
         }
     }
 
@@ -493,6 +573,9 @@ impl Session {
     /// (creating a table if needed) unless `wait_to_seat` / Manual holds them
     /// in the waiting lobby.
     pub async fn place(&self, sub: &str, name: &str) -> Placement {
+        // Serialize placement: simultaneous arrivals (e.g. spawned test tabs)
+        // otherwise race to create tables / grab seats, scattering the fill.
+        let _seat_guard = self.seating.lock().await;
         let rooms = self.rooms_snapshot().await;
         // 1. Reconnect: an existing seat always wins.
         for room in &rooms {
@@ -525,10 +608,11 @@ impl Session {
             return Placement { room, seat: None };
         }
         // 3. New arrival: auto-seat unless waiting-room / manual.
-        let auto = !self.wait_to_seat.load(Ordering::SeqCst)
-            && !matches!(self.seat_policy, SeatPolicy::Manual);
+        let policy = self.seat_policy();
+        let auto =
+            !self.wait_to_seat.load(Ordering::SeqCst) && !matches!(policy, SeatPolicy::Manual);
         if auto {
-            let (room, seat) = self.seat_one(&self.seat_policy, sub, name).await;
+            let (room, seat) = self.seat_one(&policy, sub, name).await;
             return Placement {
                 room,
                 seat: Some(seat),
@@ -572,6 +656,7 @@ impl Session {
     /// Seat every WAITING (non-parked) lobby member per the bulk shape,
     /// creating tables as needed. Returns the rooms whose seats changed.
     pub async fn seat_students(&self) -> Vec<Arc<Room>> {
+        let _seat_guard = self.seating.lock().await;
         let waiting: Vec<(String, String)> = {
             let kib = self.kibitzers.lock().await;
             kib.iter()
@@ -932,6 +1017,9 @@ impl Session {
             "set_label": set_label,
             "loaded": total > 0,
             "wait_to_seat": self.wait_to_seat.load(Ordering::SeqCst),
+            "seat_policy": self.seat_policy().key(),
+            "bot_mode": self.bot_mode().as_str(),
+            "bots_paused": self.bots_paused(),
             "boards": {
                 "total": total,
                 "open": self.open_boards.load(Ordering::SeqCst),
@@ -1468,5 +1556,64 @@ mod tests {
             ids(&s.rooms_snapshot().await),
             vec!["s1-t1", "s1-t2", "s1-t3", "s1-t4"]
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_arrivals_fill_deterministically() {
+        // 4 students connecting at once (spawned tabs) must fill ONE table
+        // S/W/N/E, not race into scattered tables (the seating lock).
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 0);
+        let (p0, p1, p2, p3) = tokio::join!(
+            s.place("g0", "A"),
+            s.place("g1", "B"),
+            s.place("g2", "C"),
+            s.place("g3", "D"),
+        );
+        assert_eq!(s.table_count().await, 1, "one table, not a scatter");
+        let mut seats: Vec<char> = [&p0, &p1, &p2, &p3]
+            .iter()
+            .map(|p| p.seat.unwrap().to_char())
+            .collect();
+        seats.sort_unstable();
+        assert_eq!(seats, vec!['E', 'N', 'S', 'W'], "all four distinct seats");
+    }
+
+    #[tokio::test]
+    async fn set_seat_policy_changes_auto_seat_live() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        // Switch to one-per-table (South) live.
+        s.set_seat_policy(SeatPolicy::from_key("one_per_south").unwrap());
+        assert_eq!(s.seat_policy().key(), "one_per_south");
+        let p1 = s.place("g1", "A").await;
+        let p2 = s.place("g2", "B").await;
+        assert_eq!((tidx(&p1), p1.seat), (0, Some(South)));
+        // Second student → a new table (one per table).
+        assert_eq!((tidx(&p2), p2.seat), (1, Some(South)));
+        assert!(SeatPolicy::from_key("nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_bots() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        assert!(!s.bots_paused());
+        s.set_bots_paused(true).await;
+        assert!(s.bots_paused());
+        s.set_bots_paused(false).await;
+        assert!(!s.bots_paused());
+    }
+
+    #[tokio::test]
+    async fn set_bot_mode_applies_and_surfaces() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        s.set_bot_mode(crate::rooms::BotMode::Random).await;
+        assert_eq!(s.bot_mode().as_str(), "random");
+        assert_eq!(
+            room_at(&s, 0).await.bot_mode().as_str(),
+            "random",
+            "existing table updated"
+        );
+        // New tables inherit it.
+        let r = s.add_room().await;
+        assert_eq!(r.bot_mode().as_str(), "random");
     }
 }
