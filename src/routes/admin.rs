@@ -104,9 +104,16 @@ async fn create_session(
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("seat_policy: {e}")),
     };
-    let boards = match parse_boards(&req.boards_pbn) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    // An empty board set is allowed: the session starts idle (no deal
+    // loaded) and the teacher sends a source later via `load_boards`
+    // (roadmap §Phase 3.1). A non-empty PBN is parsed + validated here.
+    let boards = if req.boards_pbn.trim().is_empty() {
+        Vec::new()
+    } else {
+        match parse_boards(&req.boards_pbn) {
+            Ok(b) => b,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        }
     };
     let board_count = boards.len();
 
@@ -154,7 +161,7 @@ async fn create_session(
             "id": session.id,
             "created": created,
             "tables": session.rooms.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
-            "boards": session.boards.len(),
+            "boards": session.deck_status().await.2,
         })),
     )
         .into_response()

@@ -197,14 +197,31 @@ pub struct Kibitzer {
     pub room_idx: usize,
 }
 
+/// The session's loaded board set. `index` is the lockstep teacher pointer
+/// (0-based current board, forced onto every table by `deal_index_to_all`).
+/// An empty `boards` = idle: no deal loaded yet, rooms hold a throwaway
+/// placeholder board and bots stay off until `load_boards`.
+pub struct Deck {
+    pub boards: Arc<Vec<BoardSetup>>,
+    /// Brief human-readable description of the set (picker-generated), for
+    /// the teacher console + server logs. None while idle.
+    pub label: Option<String>,
+    /// Lockstep teacher pointer: 0-based index of the board all teacher_set
+    /// tables are on. Reset to 0 on load.
+    pub index: usize,
+}
+
 pub struct Session {
     pub id: String,
     pub kind: SessionKind,
     pub owner_sub: String,
     pub seat_policy: SeatPolicy,
-    pub boards: Vec<BoardSetup>,
+    /// The loaded set + label + lockstep pointer. Swappable at runtime
+    /// (`load_boards`); empty = idle. Never held across a room lock.
+    pub deck: Mutex<Deck>,
     pub rooms: Vec<Arc<Room>>,
-    /// `boards[0..open_boards]` may be played. Monotonically non-decreasing.
+    /// Adhoc open-board window (all boards open once a set is loaded).
+    /// teacher_set ignores it — it's teacher-driven lockstep (`deal_index_to_all`).
     pub open_boards: AtomicUsize,
     /// Session-level notifications (LOBBY / RECHECK markers). Subscribed by
     /// every connection in the session; players ignore LOBBY, teachers
@@ -232,20 +249,31 @@ impl Session {
         table_count: usize,
     ) -> Arc<Self> {
         let open = match kind {
-            SessionKind::TeacherSet => 1,
+            SessionKind::TeacherSet => boards.len().min(1),
             SessionKind::Adhoc => boards.len(),
         };
+        // Idle sessions (no boards yet) seed rooms with a throwaway placeholder
+        // so `TableState` stays valid; `loaded()` is false and bots stay off
+        // until a set is loaded, and the client shows a "waiting" overlay.
+        let seed = boards
+            .first()
+            .cloned()
+            .unwrap_or_else(|| crate::rooms::random_board(1));
         let (notify, _) = broadcast::channel(64);
         Arc::new_cyclic(|weak: &Weak<Session>| {
             let rooms = (1..=table_count)
-                .map(|i| Room::new(format!("{id}-t{i}"), boards[0].clone(), Some(weak.clone())))
+                .map(|i| Room::new(format!("{id}-t{i}"), seed.clone(), Some(weak.clone())))
                 .collect();
             Session {
                 id,
                 kind,
                 owner_sub,
                 seat_policy,
-                boards,
+                deck: Mutex::new(Deck {
+                    boards: Arc::new(boards),
+                    label: None,
+                    index: 0,
+                }),
                 rooms,
                 open_boards: AtomicUsize::new(open),
                 notify,
@@ -480,9 +508,11 @@ impl Session {
     }
 
     /// Widen the open-board window to `count` (absolute, clamped to the
-    /// board list, never narrowing). Returns the new count.
-    pub fn open_boards_to(&self, count: usize) -> usize {
-        let clamped = count.min(self.boards.len());
+    /// board list, never narrowing). Returns the new count. Adhoc only —
+    /// teacher_set is lockstep. `count` is clamped to the loaded set size.
+    pub async fn open_boards_to(&self, count: usize) -> usize {
+        let total = self.deck.lock().await.boards.len();
+        let clamped = count.min(total);
         self.open_boards
             .fetch_max(clamped, Ordering::SeqCst)
             .max(clamped)
@@ -490,17 +520,26 @@ impl Session {
 
     /// Advance `room` to its next board if allowed (see module docs), or
     /// unconditionally when `force`. Returns true if the board changed.
+    /// **teacher_set never self-advances** — it's teacher-driven lockstep
+    /// (`deal_index_to_all`); the auto path here is the adhoc round flow.
     /// On advance: fresh TableState, cleared ready set + BBA cache,
     /// `board_advanced` event + per-viewer snapshot resync, lobby refresh,
     /// bot kick.
     pub async fn try_advance(&self, room: &Arc<Room>, force: bool) -> bool {
+        // Snapshot the loaded set (cheap Arc clone) so we never hold the deck
+        // lock across a room lock — keeps the module's no-nested-locks rule.
+        let boards = self.deck.lock().await.boards.clone();
         let event = {
             let mut inner = room.state.lock().await;
             let next = inner.board_index + 1;
-            if next >= self.boards.len() {
+            if next >= boards.len() {
                 return false;
             }
             if !force {
+                // Lockstep: teacher_set tables move only on a teacher command.
+                if self.kind == SessionKind::TeacherSet {
+                    return false;
+                }
                 if next >= self.open_boards.load(Ordering::SeqCst) {
                     return false; // waiting for the teacher's next round
                 }
@@ -517,14 +556,14 @@ impl Session {
                 }
             }
             inner.board_index = next;
-            inner.table = TableState::new(self.boards[next].clone());
+            inner.table = TableState::new(boards[next].clone());
             inner.ready.clear();
             json!({
                 "t": "event",
                 "table_id": room.id,
                 "seq": 0,
                 "kind": "board_advanced",
-                "board_no": self.boards[next].number,
+                "board_no": boards[next].number,
                 "board_index": next,
                 "forced": force,
             })
@@ -540,9 +579,116 @@ impl Session {
         true
     }
 
+    /// True once a real board set is loaded (idle sessions have none).
+    pub async fn loaded(&self) -> bool {
+        !self.deck.lock().await.boards.is_empty()
+    }
+
+    /// Reconnect/status trio: (set label, current 1-based board, total).
+    /// Idle → (None, 0, 0). This is what a reconnecting teacher renders as
+    /// "‹label› — board 3 of 8".
+    pub async fn deck_status(&self) -> (Option<String>, usize, usize) {
+        let d = self.deck.lock().await;
+        let total = d.boards.len();
+        let current = if total == 0 { 0 } else { d.index + 1 };
+        (d.label.clone(), current, total)
+    }
+
+    /// Replace the loaded set ("change deal source"): store boards + label,
+    /// reset the pointer to board 1, and deal it to every table (lockstep).
+    /// Errors on an empty set. Returns the board total.
+    pub async fn load_boards(
+        &self,
+        boards: Vec<BoardSetup>,
+        label: Option<String>,
+    ) -> Result<usize, String> {
+        if boards.is_empty() {
+            return Err("no boards to load".into());
+        }
+        let total = boards.len();
+        {
+            let mut d = self.deck.lock().await;
+            d.boards = Arc::new(boards);
+            d.label = label.clone();
+            d.index = 0;
+        }
+        // Adhoc opens the whole set; teacher_set ignores this (lockstep).
+        self.open_boards.store(total, Ordering::SeqCst);
+        tracing::info!(
+            event = "load_boards",
+            session = %self.id,
+            label = label.as_deref().unwrap_or(""),
+            total,
+            "loaded deal set"
+        );
+        self.deal_index_to_all(0).await;
+        Ok(total)
+    }
+
+    /// Force every table to board `index` (0-based, clamped to the set).
+    /// Lockstep — both directions, teacher-driven. Fresh TableState, cleared
+    /// ready + BBA cache, `board_advanced` (forced) + resync + lobby + bot
+    /// kick per room. Returns the new 1-based board number (0 if idle).
+    async fn deal_index_to_all(&self, index: usize) -> usize {
+        let (idx, board) = {
+            let mut d = self.deck.lock().await;
+            if d.boards.is_empty() {
+                return 0;
+            }
+            let idx = index.min(d.boards.len() - 1);
+            d.index = idx;
+            (idx, d.boards[idx].clone())
+        };
+        for room in &self.rooms {
+            {
+                let mut inner = room.state.lock().await;
+                inner.board_index = idx;
+                inner.table = TableState::new(board.clone());
+                inner.ready.clear();
+            }
+            *room.bba_cache.lock().await = None;
+            room.broadcast(
+                json!({
+                    "t": "event",
+                    "table_id": room.id,
+                    "seq": 0,
+                    "kind": "board_advanced",
+                    "board_no": board.number,
+                    "board_index": idx,
+                    "forced": true,
+                })
+                .to_string(),
+            );
+            room.broadcast_resync();
+            crate::bots::kick(room.clone());
+        }
+        self.notify_lobby();
+        idx + 1
+    }
+
+    /// Jump all tables to a 1-based board number (Shark "go to"). Clamped.
+    pub async fn goto_board(&self, one_based: usize) -> usize {
+        self.deal_index_to_all(one_based.saturating_sub(1)).await
+    }
+
+    /// Advance all tables one board (Shark "Next Deal"). Clamped at the end.
+    pub async fn next_board(&self) -> usize {
+        let cur = self.deck.lock().await.index;
+        self.deal_index_to_all(cur + 1).await
+    }
+
+    /// Back all tables up one board (Shark "Replay/redo" at the set level).
+    pub async fn prev_board(&self) -> usize {
+        let cur = self.deck.lock().await.index;
+        self.deal_index_to_all(cur.saturating_sub(1)).await
+    }
+
     /// The teacher's lobby frame: every table's seats/board/phase/tricks
     /// plus the kibitzer roster. Sent on teacher join and on any change.
     pub async fn lobby_json(&self) -> String {
+        // Deck snapshot first (locked + dropped) so we never nest it under a
+        // room lock in the loop below.
+        let (set_label, cur_board, total) = self.deck_status().await;
         let mut tables = Vec::with_capacity(self.rooms.len());
         for room in &self.rooms {
             let inner = room.state.lock().await;
@@ -621,9 +767,14 @@ impl Session {
         json!({
             "t": "lobby",
             "session_id": self.id,
+            // Reconnect status: a teacher rejoining renders
+            // "‹set_label› — board {index} of {total}" straight from here.
+            "set_label": set_label,
+            "loaded": total > 0,
             "boards": {
-                "total": self.boards.len(),
+                "total": total,
                 "open": self.open_boards.load(Ordering::SeqCst),
+                "index": cur_board,
             },
             "tables": tables,
             "kibitzers": kibitzers,
@@ -760,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teacher_set_gates_advance_on_open_boards_and_ready() {
+    async fn teacher_set_is_lockstep_not_self_advancing() {
         let s = session(
             SessionKind::TeacherSet,
             SeatPolicy::OnePerSeat(vec![South]),
@@ -769,17 +920,15 @@ mod tests {
         s.place("g1", "Ann").await; // t0 South
         let room = s.rooms[0].clone();
 
-        // Not ready, board not open: no advance.
-        assert!(!s.try_advance(&room, false).await);
-
-        // Ready but the next board isn't open yet (teacher_set opens 1).
+        // Even ready + a widened window: teacher_set NEVER self-advances
+        // (it's teacher-driven lockstep).
         room.state.lock().await.ready.insert(South);
-        assert!(!s.try_advance(&room, false).await);
+        assert_eq!(s.open_boards_to(2).await, 2);
+        assert!(!s.try_advance(&room, false).await, "teacher_set is lockstep");
 
-        // Teacher opens round 2: now it advances, and the ready set clears.
-        assert_eq!(s.open_boards_to(2), 2);
-        assert!(s.try_advance(&room, false).await);
-        {
+        // The teacher drives EVERY table together with next_board.
+        assert_eq!(s.next_board().await, 2, "1-based board number");
+        for room in &s.rooms {
             let inner = room.state.lock().await;
             assert_eq!(inner.board_index, 1);
             assert_eq!(inner.table.board.number, 2);
@@ -787,11 +936,104 @@ mod tests {
             assert_eq!(inner.table.seq(), 0, "fresh action log on the new board");
         }
 
-        // No board 3: never advances, even forced.
-        assert!(!s.try_advance(&room, true).await);
-
-        // The other table is independent — still on board 1.
+        // And can back everyone up (Shark redo).
+        assert_eq!(s.prev_board().await, 1);
+        assert_eq!(s.rooms[0].state.lock().await.board_index, 0);
         assert_eq!(s.rooms[1].state.lock().await.board_index, 0);
+
+        // next past the end clamps (stays on the last board).
+        s.next_board().await;
+        assert_eq!(s.next_board().await, 2, "clamped at the last board");
+    }
+
+    #[tokio::test]
+    async fn load_boards_swaps_set_resets_to_one_and_labels() {
+        // Start idle (no boards), then load a labelled set.
+        let s = Session::new(
+            "s1".into(),
+            SessionKind::TeacherSet,
+            "o".into(),
+            SeatPolicy::Manual,
+            vec![],
+            2,
+        );
+        assert!(!s.loaded().await);
+        assert_eq!(s.deck_status().await, (None, 0, 0));
+
+        assert_eq!(
+            s.load_boards(
+                parse_boards(TWO_BOARDS).unwrap(),
+                Some("Scenarios - Transfers".into())
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert!(s.loaded().await);
+        let (label, cur, total) = s.deck_status().await;
+        assert_eq!(label.as_deref(), Some("Scenarios - Transfers"));
+        assert_eq!((cur, total), (1, 2));
+        for room in &s.rooms {
+            assert_eq!(room.state.lock().await.table.board.number, 1);
+        }
+
+        // Move forward, then load a fresh set → pointer resets to board 1.
+        s.next_board().await;
+        assert_eq!(s.deck_status().await.1, 2);
+        s.load_boards(parse_boards(TWO_BOARDS).unwrap(), Some("Mix".into()))
+            .await
+            .unwrap();
+        assert_eq!(s.deck_status().await.1, 1, "load resets the pointer");
+
+        // An empty load is rejected.
+        assert!(s.load_boards(vec![], None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn goto_clamps_and_moves_every_table() {
+        let s = session(SessionKind::TeacherSet, SeatPolicy::FirstFree, 2);
+        assert_eq!(s.goto_board(99).await, 2, "clamped to the last board");
+        for room in &s.rooms {
+            assert_eq!(room.state.lock().await.board_index, 1);
+        }
+        assert_eq!(s.goto_board(1).await, 1);
+        for room in &s.rooms {
+            assert_eq!(room.state.lock().await.board_index, 0);
+        }
+        assert_eq!(s.goto_board(0).await, 1, "board 0 clamps to board 1");
+    }
+
+    #[tokio::test]
+    async fn idle_session_is_valid_and_reports_unloaded() {
+        let s = Session::new(
+            "s1".into(),
+            SessionKind::TeacherSet,
+            "o".into(),
+            SeatPolicy::FirstFree,
+            vec![],
+            1,
+        );
+        assert!(!s.loaded().await);
+        // Placeholder board keeps TableState valid pre-load (seating works).
+        assert_eq!(
+            s.rooms[0]
+                .state
+                .lock()
+                .await
+                .table
+                .board
+                .deal
+                .total_cards(),
+            52
+        );
+        // No set → nothing advances, even forced.
+        assert!(!s.try_advance(&s.rooms[0].clone(), true).await);
+        // Lobby reports the idle state.
+        let lobby: Value = serde_json::from_str(&s.lobby_json().await).unwrap();
+        assert_eq!(lobby["loaded"], false);
+        assert_eq!(lobby["set_label"], Value::Null);
+        assert_eq!(lobby["boards"]["total"], 0);
+        assert_eq!(lobby["boards"]["index"], 0);
     }
 
     #[tokio::test]
@@ -856,9 +1098,9 @@ mod tests {
             SeatPolicy::OnePerSeat(vec![South]),
             1,
         );
-        assert_eq!(s.open_boards_to(2), 2);
-        assert_eq!(s.open_boards_to(1), 2, "cannot close a round");
-        assert_eq!(s.open_boards_to(99), 2, "clamped to the board count");
+        assert_eq!(s.open_boards_to(2).await, 2);
+        assert_eq!(s.open_boards_to(1).await, 2, "cannot close a round");
+        assert_eq!(s.open_boards_to(99).await, 2, "clamped to the board count");
     }
 
     #[tokio::test]

@@ -113,6 +113,14 @@ pub fn kick(room: Arc<Room>) {
     }
     tokio::spawn(async move {
         loop {
+            // Idle session (no deal loaded yet): bots stay off until the
+            // teacher loads a set (roadmap §Phase 3.1).
+            if let Some(s) = room.session() {
+                if !s.loaded().await {
+                    room.bot_running.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
             let acted = act_once(&room).await;
             if !acted {
                 room.bot_running.store(false, Ordering::SeqCst);

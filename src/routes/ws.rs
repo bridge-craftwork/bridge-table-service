@@ -14,7 +14,11 @@
 //!                    {"t":"assign_seat","table":ID,"seat":"S","sub":SUB|null} |
 //!                    {"t":"boot","table":ID,"seat":"S"} |
 //!                    {"t":"force_advance","table":ID} |
-//!                    {"t":"kibitz","table":ID}
+//!                    {"t":"kibitz","table":ID} |
+//!                    runtime deal source + lockstep board nav (§Phase 3.1):
+//!                    {"t":"load_boards","boards_pbn":"…","label":"…"} |
+//!                    {"t":"goto_board","index":N} (1-based) |
+//!                    {"t":"next_board"} | {"t":"prev_board"}
 //!   server → client: {"t":"welcome"…} then {"t":"snapshot"…} on join,
 //!                    after any undo/board change, and after the opening
 //!                    lead; {"t":"event"…} per action; {"t":"lobby"…}
@@ -171,10 +175,13 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
         tracing::info!(event = "bot_mode_set", mode = mode.as_str(), room = %room.id, sub = %ticket.sub, "");
     }
 
+    // Deck status fetched before the room lock (welcome_msg must not lock the
+    // deck while we hold the room — no nested locks).
+    let status = session.deck_status().await;
     let (welcome, snapshot, seats_ev) = {
         let inner = room.state.lock().await;
         (
-            welcome_msg(&session, &room, &ticket, seat),
+            welcome_msg(&session, &room, &ticket, seat, &status),
             snapshot_msg(&room.id, &inner, seat, false),
             seats_event(&room, &inner),
         )
@@ -241,8 +248,9 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
                         match resolve_binding(&session, &ticket, &mut room, &mut seat, &mut room_events).await {
                             Rebind::Unchanged => {}
                             Rebind::Changed => {
+                                let status = session.deck_status().await;
                                 let inner = room.state.lock().await;
-                                let welcome = welcome_msg(&session, &room, &ticket, seat);
+                                let welcome = welcome_msg(&session, &room, &ticket, seat, &status);
                                 let snap = snapshot_msg(&room.id, &inner, seat, false);
                                 drop(inner);
                                 if tx.send(Message::Text(welcome)).await.is_err()
@@ -290,8 +298,19 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
     tracing::info!(event = "ws_left", sub = %ticket.sub, room = %room.id, session = %session.id, "");
 }
 
-fn welcome_msg(session: &Session, room: &Room, ticket: &Ticket, seat: Option<Direction>) -> String {
+/// `status` is the session's `deck_status()` trio (label, current 1-based
+/// board, total) — passed in (not read here) so the caller can fetch it
+/// before locking the room, keeping the no-nested-locks rule. `total == 0`
+/// means no deal is loaded yet → the client shows a "waiting" overlay.
+fn welcome_msg(
+    session: &Session,
+    room: &Room,
+    ticket: &Ticket,
+    seat: Option<Direction>,
+    status: &(Option<String>, usize, usize),
+) -> String {
     let bot_mode = room.bot_mode().as_str();
+    let (label, current, total) = status;
     json!({
         "t": "welcome",
         "session_id": session.id,
@@ -300,6 +319,12 @@ fn welcome_msg(session: &Session, room: &Room, ticket: &Ticket, seat: Option<Dir
         "role": ticket.role,
         "seat": seat.map(|s| s.to_char().to_string()),
         "bot_mode": bot_mode,
+        // Deal-set status so the client renders the board or a "waiting for
+        // the teacher to load a deal" overlay (roadmap §Phase 3.1).
+        "loaded": total > &0,
+        "set_label": label,
+        "board": current,
+        "board_total": total,
     })
     .to_string()
 }
@@ -513,7 +538,8 @@ async fn handle_teacher_msg(
             let Some(count) = v["count"].as_u64() else {
                 return Some(err_msg("bad_count", "open_boards.count missing"));
             };
-            let open = session.open_boards_to(count as usize);
+            let open = session.open_boards_to(count as usize).await;
+            let total = session.deck_status().await.2;
             // Tell every table (players see "next board available"), then
             // move any table whose humans are already all ready.
             for room in &session.rooms {
@@ -523,7 +549,7 @@ async fn handle_teacher_msg(
                         "table_id": room.id,
                         "kind": "boards_open",
                         "open": open,
-                        "total": session.boards.len(),
+                        "total": total,
                     })
                     .to_string(),
                 );
@@ -532,6 +558,46 @@ async fn handle_teacher_msg(
                 session.try_advance(room, false).await;
             }
             session.notify_lobby();
+            None
+        }
+        // ---- Runtime deal source + lockstep board navigation (Shark model,
+        // roadmap §Phase 3.1). All force EVERY table together. ----
+        Some("load_boards") => {
+            let Some(pbn) = v["boards_pbn"].as_str() else {
+                return Some(err_msg("bad_pbn", "load_boards.boards_pbn missing"));
+            };
+            let boards = match crate::sessions::parse_boards(pbn) {
+                Ok(b) => b,
+                Err(e) => return Some(err_msg("bad_pbn", &e)),
+            };
+            let label = v["label"].as_str().map(|s| s.to_string());
+            match session.load_boards(boards, label).await {
+                Ok(_) => None,
+                Err(e) => Some(err_msg("rejected", &e)),
+            }
+        }
+        Some("goto_board") => {
+            let Some(n) = v["index"].as_u64() else {
+                return Some(err_msg("bad_index", "goto_board.index missing"));
+            };
+            if !session.loaded().await {
+                return Some(err_msg("no_set", "no deal set loaded"));
+            }
+            session.goto_board(n as usize).await;
+            None
+        }
+        Some("next_board") => {
+            if !session.loaded().await {
+                return Some(err_msg("no_set", "no deal set loaded"));
+            }
+            session.next_board().await;
+            None
+        }
+        Some("prev_board") => {
+            if !session.loaded().await {
+                return Some(err_msg("no_set", "no deal set loaded"));
+            }
+            session.prev_board().await;
             None
         }
         Some("force_advance") => {
