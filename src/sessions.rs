@@ -607,6 +607,28 @@ impl Session {
             };
             return Placement { room, seat: None };
         }
+        // 2.5. Name reclaim: a guest who lost their tab reconnects under a fresh
+        //   sub (guest subs are random per mint). If a DISCONNECTED seat holds
+        //   their display name, take it over instead of creating a duplicate —
+        //   otherwise the same student shows up at two tables.
+        for room in &rooms {
+            let mut inner = room.state.lock().await;
+            let stale = inner
+                .seats
+                .iter()
+                .find(|(_, o)| !o.connected && o.name == name)
+                .map(|(&s, _)| s);
+            if let Some(seat) = stale {
+                let occ = inner.seats.get_mut(&seat).unwrap();
+                occ.sub = sub.to_string();
+                occ.connected = true;
+                occ.disconnected_at = None;
+                return Placement {
+                    room: room.clone(),
+                    seat: Some(seat),
+                };
+            }
+        }
         // 3. New arrival: auto-seat unless waiting-room / manual.
         let policy = self.seat_policy();
         let auto =
@@ -1600,6 +1622,27 @@ mod tests {
         assert!(s.bots_paused());
         s.set_bots_paused(false).await;
         assert!(!s.bots_paused());
+    }
+
+    #[tokio::test]
+    async fn disconnected_guest_reclaims_seat_by_name() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        let p = s.place("g1", "Bob").await; // South
+        assert_eq!(p.seat, Some(South));
+        // Bob's tab drops → seat goes disconnected.
+        room_at(&s, 0)
+            .await
+            .state
+            .lock()
+            .await
+            .mark_disconnected("g1");
+        // Bob reopens with a fresh guest sub + same name → reclaims his seat,
+        // no duplicate table/seat.
+        let p2 = s.place("g2-new", "Bob").await;
+        assert_eq!((tidx(&p2), p2.seat), (0, Some(South)));
+        assert_eq!(s.table_count().await, 1, "no duplicate table");
+        assert_eq!(seated_at(&s, "g2-new").await, Some(("s1-t1".into(), South)));
+        assert_eq!(seated_at(&s, "g1").await, None, "old sub replaced");
     }
 
     #[tokio::test]
