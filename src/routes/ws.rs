@@ -6,7 +6,10 @@
 //!                    stays out of proxy logs; optional "bot":"random" or
 //!                    "bot":"rules" switches the table to RandomLegal or
 //!                    bridge-rulebot bots for testing — the welcome echoes
-//!                    "bot_mode":"real"|"random"|"rules"), then
+//!                    "bot_mode":"real"|"random"|"rules"; optional
+//!                    "as_player":true lets the session owner join SEATED
+//!                    (host-as-player) instead of the see-all controller,
+//!                    keeping the host-control frames from their seat), then
 //!                    {"t":"bid","call":"1H"} | {"t":"play","card":"SA"} |
 //!                    {"t":"undo","to_seq":N} | {"t":"ready_next_board"} |
 //!                    {"t":"pong"};
@@ -147,8 +150,11 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
     // Session routing: the ticket names the session; "demo" is the standing
     // dev room (no admin setup required).
     if let Some(session) = state.rooms.get_session(&hello.ticket.session_id).await {
-        let is_teacher = hello.ticket.sub == session.owner_sub || hello.ticket.role == "teacher";
-        if is_teacher {
+        let is_controller = hello.ticket.sub == session.owner_sub || hello.ticket.role == "teacher";
+        // The owner/teacher normally joins as the see-all controller. `as_player`
+        // lets them instead take a seat and play (host-as-player) while still
+        // holding the host control frames (dispatched in handle_player).
+        if is_controller && !hello.as_player {
             handle_teacher(socket, state, session, hello).await;
         } else {
             handle_player(socket, state, session, hello).await;
@@ -280,7 +286,16 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
                     let _ = tx.send(Message::Text(err_msg("bad_json", "unparseable message"))).await;
                     continue;
                 };
-                if let Some(reply) = handle_client_msg(&room, Some(&session), &ticket, seat, &v).await {
+                // A seated OWNER is the host: bid/play/undo run through their
+                // seat, but the host control frames (deal source, seating, bots)
+                // dispatch to the same handler the console uses. A seated owner
+                // isn't kibitzing, so pass no kibitz room.
+                let reply = if ticket.sub == session.owner_sub && is_host_control(&v) {
+                    handle_teacher_msg(&session, None, &ticket, &v).await
+                } else {
+                    handle_client_msg(&room, Some(&session), &ticket, seat, &v).await
+                };
+                if let Some(reply) = reply {
                     if tx.send(Message::Text(reply)).await.is_err() {
                         break;
                     }
@@ -526,6 +541,29 @@ async fn recv_opt(
 
 /// Teacher control messages. Returns an error frame for this client only;
 /// state changes announce themselves via broadcasts / lobby refreshes.
+/// The session-control frames a seated host (owner) may send in addition to the
+/// player frames (bid/play/undo/pong) — the same ones the console uses. Anything
+/// not listed here falls through to the normal player message handler.
+fn is_host_control(v: &Value) -> bool {
+    matches!(
+        v["t"].as_str(),
+        Some("load_boards")
+            | Some("goto_board")
+            | Some("next_board")
+            | Some("prev_board")
+            | Some("open_boards")
+            | Some("force_advance")
+            | Some("seat_students")
+            | Some("wait_to_seat")
+            | Some("add_tables")
+            | Some("set_seat_policy")
+            | Some("set_bot_mode")
+            | Some("pause_bots")
+            | Some("assign_seat")
+            | Some("boot")
+    )
+}
+
 async fn handle_teacher_msg(
     session: &Arc<Session>,
     kibitz: Option<&Arc<Room>>,
@@ -830,6 +868,11 @@ struct Hello {
     /// (testing convenience: switches the table's bot backend, skipping
     /// BBA/BEN — see `rooms::BotMode`).
     bot_override: Option<crate::rooms::BotMode>,
+    /// Set iff the hello carried `"as_player": true`. Lets the session OWNER
+    /// (or a teacher-role ticket) join as a seated player — host-as-player —
+    /// instead of the see-all controller. A seated owner still holds the host
+    /// control frames from their seat (see handle_player).
+    as_player: bool,
 }
 
 async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<Hello> {
@@ -871,6 +914,7 @@ async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<H
         Ok(ticket) => Some(Hello {
             ticket,
             bot_override: v["bot"].as_str().and_then(crate::rooms::BotMode::parse),
+            as_player: v["as_player"].as_bool().unwrap_or(false),
         }),
         Err(e) => {
             let _ = socket
@@ -1198,6 +1242,39 @@ async fn handle_client_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_host_control_covers_session_frames_not_play_frames() {
+        // A seated host (owner) may send these session-control frames…
+        for t in [
+            "load_boards",
+            "goto_board",
+            "next_board",
+            "prev_board",
+            "open_boards",
+            "force_advance",
+            "seat_students",
+            "wait_to_seat",
+            "add_tables",
+            "set_seat_policy",
+            "set_bot_mode",
+            "pause_bots",
+            "assign_seat",
+            "boot",
+        ] {
+            assert!(
+                is_host_control(&json!({ "t": t })),
+                "{t} should be host-control"
+            );
+        }
+        // …but play frames route through the normal seated-player path.
+        for t in ["bid", "play", "undo", "pong", "kibitz", "hello", "nonsense"] {
+            assert!(
+                !is_host_control(&json!({ "t": t })),
+                "{t} must NOT be host-control"
+            );
+        }
+    }
 
     #[test]
     fn snapshot_includes_state_and_seats() {
