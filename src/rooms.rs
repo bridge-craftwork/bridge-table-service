@@ -48,7 +48,8 @@ pub enum BotMode {
     /// fallback (Pass for bidding). Opt-in via `bot:real` — BEN is slow
     /// (~10-60s cold), so only when you specifically want its cardplay.
     Real = 0,
-    /// Instant deterministic RandomLegal cardplay, Pass bidding. Testing.
+    /// Instant deterministic RandomLegal cardplay. Bidding is real (BBA), like
+    /// every mode — an all-pass auction leaves nothing to play. Fast-bot testing.
     Random = 1,
     /// BBA bidding + instant rule-based cardplay (bridge-rulebot) — real
     /// contracts defended without BEN in the loop. **Default.**

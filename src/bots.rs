@@ -298,14 +298,17 @@ async fn act_once(room: &Room) -> bool {
             board,
             calls,
         } => {
+            // Bidding is ALWAYS real (BBA) in every bot mode — an all-pass
+            // auction is useless for watching or practising cardplay, whatever
+            // the cardplay engine. Bot mode selects only the CARDPLAY bot
+            // (below). Rules/Slow adopted this 2026-07-02; Random was left
+            // all-pass, which silently passed out every served table the moment
+            // a "Test players" join flipped the sticky room mode to random
+            // (Rick, 2026-07-06).
             let (call, via) = match mode {
-                // Rules/Slow modes still bid with BBA — the rulebot is
-                // cardplay only, and all-pass auctions made the mode useless
-                // for watching real contracts (Rick, 2026-07-02).
-                BotMode::Real | BotMode::Rules | BotMode::Slow => {
+                BotMode::Real | BotMode::Rules | BotMode::Slow | BotMode::Random => {
                     choose_call(room, &board, &calls).await
                 }
-                BotMode::Random => (Call::Pass, "random"),
             };
             (seq, Action::Call { seat, call }, via, false)
         }
