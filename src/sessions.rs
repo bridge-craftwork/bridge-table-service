@@ -1648,7 +1648,10 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&changed), vec!["s1-t1"]);
         assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), South)));
-        assert!(!s.kibitzers.lock().await.contains_key("g1"), "no longer waiting");
+        assert!(
+            !s.kibitzers.lock().await.contains_key("g1"),
+            "no longer waiting"
+        );
 
         // Move South → North (target empty).
         s.assign_seat(Some("s1-t1"), Some(North), Some(South), None)
@@ -1672,7 +1675,10 @@ mod tests {
             .assign_seat(Some("s1-t1"), Some(East), None, Some("nope"))
             .await
             .is_err());
-        assert!(s.assign_seat(Some("s1-t1"), None, None, None).await.is_err());
+        assert!(s
+            .assign_seat(Some("s1-t1"), None, None, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

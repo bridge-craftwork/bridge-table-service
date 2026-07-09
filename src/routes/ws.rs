@@ -212,7 +212,9 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
 
     // Register this connection so it appears in the roster and the host can
     // address it by token (place/Sit).
-    session.register_conn(&token, &ticket.sub, &ticket.name).await;
+    session
+        .register_conn(&token, &ticket.sub, &ticket.name)
+        .await;
 
     if let Some(mode) = hello.bot_override {
         room.set_bot_mode(mode);
@@ -226,7 +228,9 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
     let (welcome, snapshot, seats_ev) = {
         let inner = room.state.lock().await;
         (
-            welcome_msg(&session, &room, &ticket, is_host, &token, &seats, &roster, &status),
+            welcome_msg(
+                &session, &room, &ticket, is_host, &token, &seats, &roster, &status,
+            ),
             snapshot_msg(&room.id, &inner, &roster),
             seats_event(&room, &inner),
         )
@@ -478,7 +482,9 @@ async fn handle_teacher(
 
     // The host is a live connection in the roster too (unseated → empty
     // seats), so it can Sit itself by its own token.
-    session.register_conn(&token, &ticket.sub, &ticket.name).await;
+    session
+        .register_conn(&token, &ticket.sub, &ticket.name)
+        .await;
     let roster = session.roster_json().await;
     let welcome = json!({
         "t": "welcome",
@@ -802,7 +808,11 @@ async fn handle_teacher_msg(
                 // boot{seat} vacates that seat.
                 (None, parse_dir(&v["seat"]), None)
             } else {
-                (parse_dir(&v["seat"]), parse_dir(&v["from"]), v["token"].as_str())
+                (
+                    parse_dir(&v["seat"]),
+                    parse_dir(&v["from"]),
+                    v["token"].as_str(),
+                )
             };
             match session.assign_seat(table, target, from, token).await {
                 Ok(changed) => {
