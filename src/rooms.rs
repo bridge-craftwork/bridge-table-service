@@ -683,7 +683,7 @@ mod tests {
 
         // The snapshot presents the board as complete with every hand
         // revealed (discussion view).
-        let snap = inner.table.snapshot(Some(South), false, true);
+        let snap = inner.table.snapshot(true);
         assert_eq!(snap["phase"], "complete");
         for seat in ["N", "E", "S", "W"] {
             assert_eq!(snap["hands"][seat]["visible"], true, "seat {seat}");

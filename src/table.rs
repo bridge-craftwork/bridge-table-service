@@ -262,26 +262,22 @@ impl TableState {
         }))
     }
 
-    /// Redacted JSON snapshot for one viewer. `viewer_seat` is the seat the
-    /// viewer occupies (None for kibitzers). `see_all` is teacher/demo mode.
+    /// Full (un-redacted) JSON snapshot of the table. Every viewer receives
+    /// ALL four hands as `{visible:true, cards:[...]}` — the client redacts
+    /// locally now (friends-table model). The snapshot is therefore
+    /// viewer-independent and safe to broadcast to every connection.
     ///
-    /// Redaction rules: you see your own hand; everyone sees dummy once the
-    /// opening lead is made; `see_all` sees everything; a COMPLETE board
-    /// shows every seat's ORIGINAL hand to everyone (post-mortem review —
-    /// the remaining cards would all be empty anyway). Hidden hands are
-    /// reported as card *counts* so the UI can render card backs.
-    ///
-    /// The DUMMY also sees the declarer's hand once the opening lead is
-    /// made (Rick 2026-07-02): with a human declarer the dummy "plays
-    /// along" mentally instead of watching the hand unfold card by card,
-    /// and with a bot declarer the human dummy actually plays the hand
-    /// (see rooms::declarer_side_controller) so they must see it.
+    /// A COMPLETE board reports each seat's ORIGINAL hand (post-mortem
+    /// review — the remaining cards would all be empty otherwise). While
+    /// play is in progress, each seat's `cards` are its REMAINING cards.
     /// `bid_only` treats a contract-reached board as complete (bid-only
-    /// boards end at the contract, with all hands revealed for discussion).
-    pub fn snapshot(&self, viewer_seat: Option<Direction>, see_all: bool, bid_only: bool) -> Value {
+    /// boards end at the contract, all hands shown for discussion).
+    ///
+    /// `legal` carries the legal actions for whichever seat is on turn
+    /// (also viewer-independent); the client shows them only for seats the
+    /// connection occupies.
+    pub fn snapshot(&self, bid_only: bool) -> Value {
         let f = self.fold();
-        let dummy = f.contract.as_ref().map(|c| c.dummy());
-        let declarer = f.contract.as_ref().map(|c| c.declarer);
         let complete = f.phase == Phase::Complete || (bid_only && f.phase == Phase::Play);
 
         let mut hands = serde_json::Map::new();
@@ -291,37 +287,23 @@ impl TableState {
             } else {
                 self.remaining(seat, &f)
             };
-            let visible = complete
-                || see_all
-                || viewer_seat == Some(seat)
-                || (f.opening_lead_made && dummy == Some(seat))
-                || (f.opening_lead_made && viewer_seat == dummy && declarer == Some(seat));
-            let entry = if visible {
+            hands.insert(
+                seat.to_char().to_string(),
                 json!({
                     "visible": true,
                     "cards": cards.iter()
                         .map(|c| format!("{}{}", c.suit.to_char(), c.rank.to_char()))
                         .collect::<Vec<_>>(),
-                })
-            } else {
-                json!({ "visible": false, "count": cards.len() })
-            };
-            hands.insert(seat.to_char().to_string(), entry);
+                }),
+            );
         }
 
+        // Legal actions for the seat on turn, regardless of viewer.
         let legal_actions = match (f.phase, f.next_to_act) {
-            (Phase::Bidding, Some(seat)) if see_all || viewer_seat == Some(seat) => {
+            (Phase::Bidding, Some(seat)) => {
                 json!({ "seat": seat.to_char().to_string(), "kind": "call" })
             }
-            // Declarer also sees dummy's legal cards (declarer plays dummy).
-            (Phase::Play, Some(seat))
-                if !complete
-                    && (see_all
-                        || viewer_seat == Some(seat)
-                        || (f.contract.as_ref().is_some_and(|c| {
-                            viewer_seat == Some(c.declarer) && seat == c.dummy()
-                        }))) =>
-            {
+            (Phase::Play, Some(seat)) if !complete => {
                 let lead_suit = current_lead_suit(&f);
                 let legal = play::legal_cards(&self.remaining(seat, &f), lead_suit)
                     .iter()
@@ -363,7 +345,6 @@ impl TableState {
             })),
             "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
             "hands": hands,
-            "your_seat": viewer_seat.map(|d| d.to_char().to_string()),
             "legal": legal_actions,
         })
     }
@@ -563,27 +544,23 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_redacts_hidden_hands() {
+    fn snapshot_shows_every_hand_to_everyone() {
+        // Un-redacted friends-table model: every seat is fully visible to
+        // any viewer (the client redacts locally now).
         let mut t = setup();
         apply_calls(&mut t, &[(North, "1S")]);
 
-        let snap = t.snapshot(Some(South), false, false);
-        assert_eq!(snap["hands"]["S"]["visible"], true);
-        assert_eq!(snap["hands"]["N"]["visible"], false);
-        assert_eq!(snap["hands"]["N"]["count"], 13);
-        assert!(snap["hands"]["N"]["cards"].is_null());
-
-        // Teacher sees everything.
-        let snap = t.snapshot(None, true, false);
-        assert_eq!(snap["hands"]["N"]["visible"], true);
-        assert_eq!(snap["hands"]["W"]["visible"], true);
+        let snap = t.snapshot(false);
+        for seat in ["N", "E", "S", "W"] {
+            assert_eq!(snap["hands"][seat]["visible"], true, "seat {seat}");
+            assert_eq!(snap["hands"][seat]["cards"].as_array().unwrap().len(), 13);
+        }
     }
 
     #[test]
-    fn snapshot_shows_original_deal_to_everyone_when_complete() {
+    fn snapshot_shows_original_deal_when_complete() {
         // A passed-out board reaches Complete with all 52 cards unplayed —
-        // the review view must show every ORIGINAL hand to any viewer,
-        // player and kibitzer alike.
+        // the review view shows every ORIGINAL hand.
         let mut t = setup();
         apply_calls(
             &mut t,
@@ -595,21 +572,16 @@ mod tests {
             ],
         );
 
-        let snap = t.snapshot(Some(South), false, false);
+        let snap = t.snapshot(false);
         assert_eq!(snap["phase"], "complete");
         for seat in ["N", "E", "S", "W"] {
             assert_eq!(snap["hands"][seat]["visible"], true, "seat {seat}");
             assert_eq!(snap["hands"][seat]["cards"].as_array().unwrap().len(), 13);
         }
-
-        // Kibitzer too.
-        let snap = t.snapshot(None, false, false);
-        assert_eq!(snap["hands"]["N"]["visible"], true);
-        assert_eq!(snap["hands"]["N"]["cards"].as_array().unwrap().len(), 13);
     }
 
     #[test]
-    fn snapshot_reveals_dummy_after_opening_lead() {
+    fn snapshot_shows_dummy_before_and_after_opening_lead() {
         let mut t = setup();
         apply_calls(
             &mut t,
@@ -623,9 +595,9 @@ mod tests {
                 (South, "Pass"),
             ],
         );
-        // Dummy is West (declarer East). Before the lead, West is hidden to N.
-        let snap = t.snapshot(Some(North), false, false);
-        assert_eq!(snap["hands"]["W"]["visible"], false);
+        // Dummy is West (declarer East) — always visible now.
+        let snap = t.snapshot(false);
+        assert_eq!(snap["hands"]["W"]["visible"], true);
 
         let s2 = Card::new(Suit::Spades, bridge_types::Rank::Two);
         t.apply(Action::Play {
@@ -633,12 +605,12 @@ mod tests {
             card: s2,
         })
         .unwrap();
-        let snap = t.snapshot(Some(North), false, false);
+        let snap = t.snapshot(false);
         assert_eq!(snap["hands"]["W"]["visible"], true);
     }
 
     #[test]
-    fn legal_cards_only_shown_to_seat_on_turn() {
+    fn legal_cards_are_for_the_seat_on_turn() {
         let mut t = setup();
         apply_calls(
             &mut t,
@@ -652,11 +624,11 @@ mod tests {
                 (South, "Pass"),
             ],
         );
-        let snap = t.snapshot(Some(South), false, false);
+        // South is on opening lead (declarer East). The snapshot is
+        // viewer-independent: legal names the seat on turn.
+        let snap = t.snapshot(false);
         assert_eq!(snap["legal"]["kind"], "card");
+        assert_eq!(snap["legal"]["seat"], "S");
         assert_eq!(snap["legal"]["cards"].as_array().unwrap().len(), 13);
-
-        let snap = t.snapshot(Some(North), false, false);
-        assert!(snap["legal"].is_null());
     }
 }

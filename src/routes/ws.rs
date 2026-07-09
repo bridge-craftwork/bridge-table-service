@@ -13,9 +13,11 @@
 //!                    {"t":"bid","call":"1H"} | {"t":"play","card":"SA"} |
 //!                    {"t":"undo","to_seq":N} | {"t":"ready_next_board"} |
 //!                    {"t":"pong"};
-//!                    teacher only: {"t":"open_boards","count":N} |
-//!                    {"t":"assign_seat","table":ID,"seat":"S","sub":SUB|null} |
-//!                    {"t":"boot","table":ID,"seat":"S"} |
+//!                    host only: {"t":"open_boards","count":N} |
+//!                    seat/token-addressed seat control (friends-table model):
+//!                    {"t":"assign_seat","table"?:ID,"seat":"S"|null,
+//!                        "from"?:"N","token"?:TOKEN}  (move | vacate | place) |
+//!                    {"t":"boot","table"?:ID,"seat":"S"}  (vacate alias) |
 //!                    {"t":"force_advance","table":ID} |
 //!                    {"t":"kibitz","table":ID} |
 //!                    runtime deal source + lockstep board nav (§Phase 3.1):
@@ -88,27 +90,46 @@ fn err_msg(code: &str, msg: &str) -> String {
     json!({ "t": "error", "code": code, "msg": msg }).to_string()
 }
 
-/// One viewer's snapshot frame: redacted table state plus the seats map, so
-/// a (re)joining client learns who is human/connected without waiting for
-/// the next seat_update event.
-fn snapshot_msg(
-    room_id: &str,
-    inner: &crate::rooms::RoomInner,
-    seat: Option<Direction>,
-    see_all: bool,
-) -> String {
+/// A random opaque per-connection token (unrelated to the ticket `sub`,
+/// which the client never receives). Keyed into the session roster.
+fn new_token() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+/// The snapshot frame: FULL (un-redacted) table state — every viewer gets
+/// all four hands, the client redacts locally — plus the per-table seats map
+/// and the session `roster`, so a (re)joining client learns the whole
+/// arrangement without waiting for the next seat_update/roster_update event.
+/// `roster` is computed by the caller (session-wide; must not be built while
+/// holding a room lock). Pass `&json!([])` for the demo room.
+fn snapshot_msg(room_id: &str, inner: &crate::rooms::RoomInner, roster: &Value) -> String {
     json!({
         "t": "snapshot",
         "table_id": room_id,
-        "state": inner.table.snapshot(
-            seat,
-            see_all,
-            inner.board_mode == crate::rooms::BoardMode::BidOnly,
-        ),
+        "state": inner
+            .table
+            .snapshot(inner.board_mode == crate::rooms::BoardMode::BidOnly),
         "board_mode": inner.board_mode.as_str(),
         "seats": inner.seats_json(),
+        "roster": roster,
     })
     .to_string()
+}
+
+/// Broadcast the session-wide `roster_update` event to every table (all
+/// seated players and kibitzing hosts receive it; unseated hosts get the
+/// roster via their lobby frame). Computes the roster once.
+async fn broadcast_roster(session: &Session) {
+    let roster = session.roster_json().await;
+    let frame = json!({
+        "t": "event",
+        "kind": "roster_update",
+        "roster": roster,
+    })
+    .to_string();
+    for room in session.rooms_snapshot().await {
+        room.broadcast(frame.clone());
+    }
 }
 
 fn seats_event(room: &Room, inner: &crate::rooms::RoomInner) -> String {
@@ -179,23 +200,34 @@ async fn handle(mut socket: WebSocket, state: SharedState) {
 
 async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Session>, hello: Hello) {
     let ticket = hello.ticket;
-    let placement = session.place(&ticket.sub, &ticket.name).await;
+    let token = new_token();
+    let is_host = ticket.sub == session.owner_sub || ticket.role == "teacher";
+    let placement = session
+        .place_seat(&ticket.sub, &ticket.name, hello.requested_seat)
+        .await;
     let mut room: Arc<Room> = placement.room;
-    let mut seat = placement.seat;
+    // A connection may hold MULTIPLE seats (host multi-seat). Arrival binds
+    // at most one; RECHECK rebinding recomputes the full set.
+    let mut seats: Vec<Direction> = placement.seat.into_iter().collect();
+
+    // Register this connection so it appears in the roster and the host can
+    // address it by token (place/Sit).
+    session.register_conn(&token, &ticket.sub, &ticket.name).await;
 
     if let Some(mode) = hello.bot_override {
         room.set_bot_mode(mode);
         tracing::info!(event = "bot_mode_set", mode = mode.as_str(), room = %room.id, sub = %ticket.sub, "");
     }
 
-    // Deck status fetched before the room lock (welcome_msg must not lock the
-    // deck while we hold the room — no nested locks).
+    // Deck status + roster fetched before the room lock (they lock the deck /
+    // other rooms; no nested locks while we hold this room).
     let status = session.deck_status().await;
+    let roster = session.roster_json().await;
     let (welcome, snapshot, seats_ev) = {
         let inner = room.state.lock().await;
         (
-            welcome_msg(&session, &room, &ticket, seat, &status),
-            snapshot_msg(&room.id, &inner, seat, false),
+            welcome_msg(&session, &room, &ticket, is_host, &token, &seats, &roster, &status),
+            snapshot_msg(&room.id, &inner, &roster),
             seats_event(&room, &inner),
         )
     };
@@ -205,13 +237,14 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
         "ws_joined",
         json!({
             "sub": ticket.sub,
-            "seat": seat.map(|s| s.to_char().to_string()),
+            "seat": seats.first().map(|s| s.to_char().to_string()),
             "room": room.id,
             "session": session.id,
         }),
     )
     .await;
     room.broadcast(seats_ev);
+    broadcast_roster(&session).await;
     session.notify_lobby();
     crate::bots::ensure_keepalive(room.clone());
     crate::bots::kick(room.clone());
@@ -230,8 +263,9 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
             broadcasted = room_events.recv() => {
                 match broadcasted {
                     Ok(msg) if msg == RESYNC => {
+                        let roster = session.roster_json().await;
                         let inner = room.state.lock().await;
-                        let snap = snapshot_msg(&room.id, &inner, seat, false);
+                        let snap = snapshot_msg(&room.id, &inner, &roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -244,8 +278,9 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let roster = session.roster_json().await;
                         let inner = room.state.lock().await;
-                        let snap = snapshot_msg(&room.id, &inner, seat, false);
+                        let snap = snapshot_msg(&room.id, &inner, &roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -257,14 +292,17 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
             notice = session_events.recv() => {
                 match notice {
                     Ok(m) if m == RECHECK => {
-                        // The teacher reseated someone — possibly us.
-                        match resolve_binding(&session, &ticket, &mut room, &mut seat, &mut room_events).await {
+                        // The host reseated someone — possibly us. Re-resolve
+                        // our table + full seat set (a connection may hold
+                        // several seats now).
+                        match resolve_seats(&session, &ticket, &mut room, &mut seats, &mut room_events).await {
                             Rebind::Unchanged => {}
                             Rebind::Changed => {
                                 let status = session.deck_status().await;
+                                let roster = session.roster_json().await;
                                 let inner = room.state.lock().await;
-                                let welcome = welcome_msg(&session, &room, &ticket, seat, &status);
-                                let snap = snapshot_msg(&room.id, &inner, seat, false);
+                                let welcome = welcome_msg(&session, &room, &ticket, is_host, &token, &seats, &roster, &status);
+                                let snap = snapshot_msg(&room.id, &inner, &roster);
                                 drop(inner);
                                 if tx.send(Message::Text(welcome)).await.is_err()
                                     || tx.send(Message::Text(snap)).await.is_err()
@@ -286,14 +324,14 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
                     let _ = tx.send(Message::Text(err_msg("bad_json", "unparseable message"))).await;
                     continue;
                 };
-                // A seated OWNER is the host: bid/play/undo run through their
-                // seat, but the host control frames (deal source, seating, bots)
-                // dispatch to the same handler the console uses. A seated owner
-                // isn't kibitzing, so pass no kibitz room.
-                let reply = if ticket.sub == session.owner_sub && is_host_control(&v) {
+                // A seated HOST (owner or teacher-role): bid/play/undo run
+                // through their seat(s), but host control frames (deal source,
+                // seating, bots) dispatch to the same handler the console uses.
+                // A seated host isn't kibitzing, so pass no kibitz room.
+                let reply = if is_host && is_host_control(&v) {
                     handle_teacher_msg(&session, None, &ticket, &v).await
                 } else {
-                    handle_client_msg(&room, Some(&session), &ticket, seat, &v).await
+                    handle_client_msg(&room, Some(&session), &ticket, &seats, &v).await
                 };
                 if let Some(reply) = reply {
                     if tx.send(Message::Text(reply)).await.is_err() {
@@ -305,17 +343,21 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
     }
 
     // Socket gone. A seated player keeps their seat (zombie-seat policy:
-    // reconnect rebinds; bots take over after the grace period). A kibitzer
-    // is simply forgotten.
+    // reconnect rebinds; bots take over after the grace period). A waiter is
+    // simply forgotten. Either way the connection leaves the roster's active
+    // set (seated → greyed via connected=false; waiter → removed).
     if session.find_seated(&ticket.sub).await.is_some() {
+        session.mark_conn_disconnected(&token).await;
         let mut inner = room.state.lock().await;
         inner.mark_disconnected(&ticket.sub);
         let ev = seats_event(&room, &inner);
         drop(inner);
         room.broadcast(ev);
     } else {
+        session.remove_conn(&token).await;
         session.remove_kibitzer(&ticket.sub).await;
     }
+    broadcast_roster(&session).await;
     session.notify_lobby();
     tracing::info!(event = "ws_left", sub = %ticket.sub, room = %room.id, session = %session.id, "");
 }
@@ -324,22 +366,37 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
 /// board, total) — passed in (not read here) so the caller can fetch it
 /// before locking the room, keeping the no-nested-locks rule. `total == 0`
 /// means no deal is loaded yet → the client shows a "waiting" overlay.
+#[allow(clippy::too_many_arguments)]
 fn welcome_msg(
     session: &Session,
     room: &Room,
     ticket: &Ticket,
-    seat: Option<Direction>,
+    is_host: bool,
+    token: &str,
+    your_seats: &[Direction],
+    roster: &Value,
     status: &(Option<String>, usize, usize),
 ) -> String {
     let bot_mode = room.bot_mode().as_str();
     let (label, current, total) = status;
+    let seats: Vec<String> = your_seats.iter().map(|s| s.to_char().to_string()).collect();
     json!({
         "t": "welcome",
         "session_id": session.id,
         "table_id": room.id,
         "name": ticket.name,
         "role": ticket.role,
-        "seat": seat.map(|s| s.to_char().to_string()),
+        // Every seat this connection occupies (may be several — multi-seat).
+        "your_seats": seats,
+        // Back-compat single seat = the first of your_seats (or null).
+        "seat": seats.first(),
+        // Host = session owner or any teacher-role ticket (drives seating).
+        "is_host": is_host,
+        // Opaque per-connection token (the client never sees `sub`). The host
+        // addresses this connection by token in assign_seat.
+        "token": token,
+        // Shared roster (also on every snapshot + roster_update).
+        "roster": roster,
         "bot_mode": bot_mode,
         // Deal-set status so the client renders the board or a "waiting for
         // the teacher to load a deal" overlay (roadmap §Phase 3.1).
@@ -356,38 +413,49 @@ enum Rebind {
     Changed,
 }
 
-/// Re-resolve this connection's table/seat after a teacher reseat. Booted
-/// players become kibitzers of the table they were removed from.
-async fn resolve_binding(
+/// Re-resolve this connection's table + full seat set after a host reseat.
+/// A connection may now hold MULTIPLE seats; a vacated connection becomes a
+/// parked waiter of the table it watched. When the connection is seated in a
+/// different room, rebind to it (single-table friends sessions never hit that
+/// branch).
+async fn resolve_seats(
     session: &Arc<Session>,
     ticket: &Ticket,
     room: &mut Arc<Room>,
-    seat: &mut Option<Direction>,
+    seats: &mut Vec<Direction>,
     room_events: &mut tokio::sync::broadcast::Receiver<String>,
 ) -> Rebind {
-    match session.find_seated(&ticket.sub).await {
-        Some((target, s)) => {
-            if target.id == room.id && *seat == Some(s) {
-                return Rebind::Unchanged;
-            }
-            if target.id != room.id {
-                *room = target.clone();
-                *room_events = room.events.subscribe();
-            }
-            *seat = Some(s);
-            session.remove_kibitzer(&ticket.sub).await;
-            Rebind::Changed
+    let all = session.find_all_seated(&ticket.sub).await;
+    if all.is_empty() {
+        if seats.is_empty() {
+            return Rebind::Unchanged; // still the same waiter
         }
-        None => {
-            if seat.is_none() {
-                return Rebind::Unchanged; // still the same lobby member
-            }
-            // Booted: assign_seat already parked us in the lobby watching this
-            // table; just drop our seat view (keep the current room).
-            *seat = None;
-            Rebind::Changed
-        }
+        // Vacated: assign_seat already parked us watching this table; just
+        // drop our seat view (keep the current room).
+        seats.clear();
+        return Rebind::Changed;
     }
+    // Bind to the room holding (the first of) our seats; collect every seat we
+    // hold there.
+    let target = all[0].0.clone();
+    let mut new_seats: Vec<Direction> = all
+        .iter()
+        .filter(|(r, _)| r.id == target.id)
+        .map(|(_, s)| *s)
+        .collect();
+    new_seats.sort_by_key(|d| d.to_char());
+    let mut cur = seats.clone();
+    cur.sort_by_key(|d| d.to_char());
+    if target.id == room.id && cur == new_seats {
+        return Rebind::Unchanged;
+    }
+    if target.id != room.id {
+        *room = target.clone();
+        *room_events = room.events.subscribe();
+    }
+    *seats = new_seats;
+    session.remove_kibitzer(&ticket.sub).await;
+    Rebind::Changed
 }
 
 // ---------------------------------------------------------------------------
@@ -401,18 +469,27 @@ async fn handle_teacher(
     hello: Hello,
 ) {
     let ticket = hello.ticket;
+    let token = new_token();
     if let Some(mode) = hello.bot_override {
         // Session-level so every table (and future ones) uses it.
         session.set_bot_mode(mode).await;
         tracing::info!(event = "bot_mode_set", mode = mode.as_str(), session = %session.id, sub = %ticket.sub, "");
     }
 
+    // The host is a live connection in the roster too (unseated → empty
+    // seats), so it can Sit itself by its own token.
+    session.register_conn(&token, &ticket.sub, &ticket.name).await;
+    let roster = session.roster_json().await;
     let welcome = json!({
         "t": "welcome",
         "session_id": session.id,
         "name": ticket.name,
         "role": "teacher",
         "seat": null,
+        "your_seats": [],
+        "is_host": true,
+        "token": token,
+        "roster": roster,
         "see_all": true,
     })
     .to_string();
@@ -427,6 +504,7 @@ async fn handle_teacher(
     for room in session.rooms_snapshot().await {
         crate::bots::ensure_keepalive(room.clone());
     }
+    broadcast_roster(&session).await;
 
     let mut session_events = session.notify.subscribe();
     // The table the teacher is currently kibitzing, if any ({"t":"kibitz"}).
@@ -465,8 +543,9 @@ async fn handle_teacher(
                 let Some(room) = &kibitz else { continue };
                 match broadcasted {
                     Ok(msg) if msg == RESYNC => {
+                        let roster = session.roster_json().await;
                         let inner = room.state.lock().await;
-                        let snap = snapshot_msg(&room.id, &inner, None, true);
+                        let snap = snapshot_msg(&room.id, &inner, &roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -478,8 +557,9 @@ async fn handle_teacher(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let roster = session.roster_json().await;
                         let inner = room.state.lock().await;
-                        let snap = snapshot_msg(&room.id, &inner, None, true);
+                        let snap = snapshot_msg(&room.id, &inner, &roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -507,8 +587,9 @@ async fn handle_teacher(
                         };
                         kibitz_events = Some(target.events.subscribe());
                         kibitz = Some(target.clone());
+                        let roster = session.roster_json().await;
                         let inner = target.state.lock().await;
-                        let snap = snapshot_msg(&target.id, &inner, None, true);
+                        let snap = snapshot_msg(&target.id, &inner, &roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -525,6 +606,10 @@ async fn handle_teacher(
             }
         }
     }
+    // Host connection gone: drop it from the roster.
+    session.remove_conn(&token).await;
+    broadcast_roster(&session).await;
+    session.notify_lobby();
     tracing::info!(event = "ws_left", sub = %ticket.sub, role = "teacher", session = %session.id, "");
 }
 
@@ -640,9 +725,11 @@ async fn handle_teacher_msg(
             None
         }
         Some("force_advance") => {
+            // A seated host may send bare `{t:"force_advance"}` — default to
+            // the session's first table when none is named.
             let room = match v["table"].as_str() {
                 Some(id) => session.room_by_id(id).await,
-                None => None,
+                None => session.rooms_snapshot().await.first().cloned(),
             };
             let Some(room) = room else {
                 return Some(err_msg("bad_table", "force_advance.table unknown"));
@@ -662,6 +749,7 @@ async fn handle_teacher_msg(
                 room.broadcast(ev);
                 crate::bots::kick(room.clone());
             }
+            broadcast_roster(session).await;
             session.notify_recheck();
             session.notify_lobby();
             None
@@ -698,24 +786,25 @@ async fn handle_teacher_msg(
                 .await;
             None
         }
+        // Seat/token-addressed host seat control (friends-table model):
+        //   {t:"assign_seat", table?, seat:<dir|null>, from?:<dir>, token?:<str>}
+        //   move : from + seat        vacate : from + seat:null
+        //   place: token + seat       (Sit self = own token)
+        // `boot` is a thin alias for vacate: {t:"boot", table?, seat:<dir>}.
         Some("assign_seat") | Some("boot") => {
-            let Some(table_id) = v["table"].as_str() else {
-                return Some(err_msg("bad_table", "table missing"));
+            let parse_dir = |val: &Value| {
+                val.as_str()
+                    .and_then(|s| s.chars().next())
+                    .and_then(Direction::from_char)
             };
-            let Some(seat) = v["seat"]
-                .as_str()
-                .and_then(|s| s.chars().next())
-                .and_then(Direction::from_char)
-            else {
-                return Some(err_msg("bad_seat", "seat missing or unrecognized"));
-            };
-            // boot ≡ assign_seat with sub:null.
-            let sub = if v["t"] == "boot" {
-                None
+            let table = v["table"].as_str();
+            let (target, from, token) = if v["t"] == "boot" {
+                // boot{seat} vacates that seat.
+                (None, parse_dir(&v["seat"]), None)
             } else {
-                v["sub"].as_str()
+                (parse_dir(&v["seat"]), parse_dir(&v["from"]), v["token"].as_str())
             };
-            match session.assign_seat(table_id, seat, sub).await {
+            match session.assign_seat(table, target, from, token).await {
                 Ok(changed) => {
                     for room in changed {
                         let inner = room.state.lock().await;
@@ -726,6 +815,7 @@ async fn handle_teacher_msg(
                         // unblock the table.
                         crate::bots::kick(room.clone());
                     }
+                    broadcast_roster(session).await;
                     session.notify_recheck();
                     session.notify_lobby();
                     None
@@ -738,7 +828,7 @@ async fn handle_teacher_msg(
             let Some(room) = kibitz else {
                 return Some(err_msg("no_table", "kibitz a table before undoing"));
             };
-            handle_client_msg(room, Some(session), ticket, None, v).await
+            handle_client_msg(room, Some(session), ticket, &[], v).await
         }
         _ => Some(err_msg("unknown", "unknown message type")),
     }
@@ -759,24 +849,33 @@ async fn handle_demo(socket: WebSocket, state: SharedState, hello: Hello) {
         tracing::info!(event = "bot_mode_set", mode = mode.as_str(), room = %room.id, sub = %ticket.sub, "");
     }
     let bot_mode = room.bot_mode().as_str();
+    let token = new_token();
+    // The demo room has no session/host; roster is empty (dev harness only).
+    let demo_roster = json!([]);
 
     let (seat, welcome, snapshot, seats_ev) = {
         let mut inner = room.state.lock().await;
         let seat = inner.seat_or_rebind(&ticket.sub, &ticket.name);
-        let see_all = ticket.role == "teacher";
+        let your_seats: Vec<String> = seat.iter().map(|s| s.to_char().to_string()).collect();
         let welcome = json!({
             "t": "welcome",
             "table_id": room.id,
             "name": ticket.name,
             "role": ticket.role,
-            "seat": seat.map(|s| s.to_char().to_string()),
+            "seat": your_seats.first(),
+            "your_seats": your_seats,
+            "is_host": ticket.role == "teacher",
+            "token": token,
+            "roster": demo_roster,
             "bot_mode": bot_mode,
         })
         .to_string();
-        let snapshot = snapshot_msg(&room.id, &inner, seat, see_all);
+        let snapshot = snapshot_msg(&room.id, &inner, &demo_roster);
         let seats_ev = seats_event(&room, &inner);
         (seat, welcome, snapshot, seats_ev)
     };
+    // Demo tracks a single seat as a one-element slice for handle_client_msg.
+    let seats: Vec<Direction> = seat.into_iter().collect();
 
     let _ = crate::observability::events::record_event(
         &state.db,
@@ -805,11 +904,10 @@ async fn handle_demo(socket: WebSocket, state: SharedState, hello: Hello) {
             broadcasted = events.recv() => {
                 match broadcasted {
                     // RESYNC is an internal marker (never sent to clients):
-                    // snapshots are per-viewer (redaction), so a broadcast
-                    // can't carry one. Each connection builds its own here.
+                    // each connection rebuilds its own snapshot frame here.
                     Ok(msg) if msg == RESYNC => {
                         let inner = room.state.lock().await;
-                        let snap = snapshot_msg(&room.id, &inner, seat, ticket.role == "teacher");
+                        let snap = snapshot_msg(&room.id, &inner, &demo_roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -823,7 +921,7 @@ async fn handle_demo(socket: WebSocket, state: SharedState, hello: Hello) {
                     // Lagged: resync with a fresh snapshot.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let inner = room.state.lock().await;
-                        let snap = snapshot_msg(&room.id, &inner, seat, ticket.role == "teacher");
+                        let snap = snapshot_msg(&room.id, &inner, &demo_roster);
                         drop(inner);
                         if tx.send(Message::Text(snap)).await.is_err() {
                             break;
@@ -839,7 +937,7 @@ async fn handle_demo(socket: WebSocket, state: SharedState, hello: Hello) {
                     let _ = tx.send(Message::Text(err_msg("bad_json", "unparseable message"))).await;
                     continue;
                 };
-                if let Some(reply) = handle_client_msg(&room, None, &ticket, seat, &v).await {
+                if let Some(reply) = handle_client_msg(&room, None, &ticket, &seats, &v).await {
                     if tx.send(Message::Text(reply)).await.is_err() {
                         break;
                     }
@@ -873,6 +971,9 @@ struct Hello {
     /// instead of the see-all controller. A seated owner still holds the host
     /// control frames from their seat (see handle_player).
     as_player: bool,
+    /// Optional `"seat":"N|E|S|W"` — the `?seat=` invite link. Under Manual
+    /// policy a free requested seat is taken directly instead of waiting.
+    requested_seat: Option<Direction>,
 }
 
 async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<Hello> {
@@ -915,6 +1016,10 @@ async fn wait_for_hello(socket: &mut WebSocket, state: &SharedState) -> Option<H
             ticket,
             bot_override: v["bot"].as_str().and_then(crate::rooms::BotMode::parse),
             as_player: v["as_player"].as_bool().unwrap_or(false),
+            requested_seat: v["seat"]
+                .as_str()
+                .and_then(|s| s.chars().next())
+                .and_then(Direction::from_char),
         }),
         Err(e) => {
             let _ = socket
@@ -932,15 +1037,20 @@ async fn handle_client_msg(
     room: &Arc<Room>,
     session: Option<&Arc<Session>>,
     ticket: &Ticket,
-    seat: Option<Direction>,
+    seats: &[Direction],
     v: &Value,
 ) -> Option<String> {
     match v["t"].as_str() {
         Some("pong") => None,
+        // Host-only frames are routed away for hosts; if a non-host sends one
+        // it lands here → refuse.
+        Some("assign_seat") | Some("boot") | Some("force_advance") => {
+            Some(err_msg("not_host", "seat management is host-only"))
+        }
         Some("bid") => {
-            let Some(seat) = seat else {
+            if seats.is_empty() {
                 return Some(err_msg("not_seated", "kibitzers cannot bid"));
-            };
+            }
             let Some(call) = v["call"].as_str().and_then(Call::from_pbn) else {
                 return Some(err_msg("bad_call", "unrecognized call"));
             };
@@ -951,8 +1061,15 @@ async fn handle_client_msg(
                     "the auction is automatic on this board",
                 ));
             }
+            // Membership turn-auth: bid as whichever of our seats is on turn.
+            let Some(turn_seat) = inner.table.fold().next_to_act else {
+                return Some(err_msg("rejected", "the auction is over"));
+            };
+            if !seats.contains(&turn_seat) {
+                return Some(err_msg("rejected", "not your turn to call"));
+            }
             match inner.table.apply(Action::Call {
-                seat,
+                seat: turn_seat,
                 call: call.clone(),
             }) {
                 Ok(seq) => {
@@ -961,7 +1078,7 @@ async fn handle_client_msg(
                         "table_id": room.id,
                         "seq": seq,
                         "kind": "bid_made",
-                        "seat": seat.to_char().to_string(),
+                        "seat": turn_seat.to_char().to_string(),
                         "call": call.to_pbn(),
                         "next_to_act": inner.table.fold().next_to_act.map(|d| d.to_char().to_string()),
                     })
@@ -972,9 +1089,9 @@ async fn handle_client_msg(
                     room.broadcast(ev);
                     if let Some(complete) = complete {
                         room.broadcast(complete);
-                        // A finished board reveals the original deal to
-                        // everyone for review (snapshot() un-redacts at
-                        // Phase::Complete) — push per-viewer snapshots.
+                        // A finished board reveals the original deal for review
+                        // (snapshot shows the complete state) — push a fresh
+                        // snapshot to everyone.
                         room.broadcast_resync();
                     }
                     room.notify_session_lobby();
@@ -985,9 +1102,9 @@ async fn handle_client_msg(
             }
         }
         Some("play") => {
-            let Some(seat) = seat else {
+            if seats.is_empty() {
                 return Some(err_msg("not_seated", "kibitzers cannot play"));
-            };
+            }
             let Some(card) = v["card"].as_str().and_then(parse_card) else {
                 return Some(err_msg("bad_card", "unrecognized card"));
             };
@@ -999,27 +1116,26 @@ async fn handle_client_msg(
                 ));
             }
             // Server-authoritative seat resolution: a play always targets the
-            // seat on turn. The sender is entitled if that's their own seat,
-            // or if they control the declarer side and the seat on turn is a
-            // declarer-side seat (declarer plays dummy's cards; a human
-            // dummy plays the hand for a bot declarer).
+            // seat on turn. The sender is entitled if they occupy that seat
+            // (membership — multi-seat), or if they control the declarer side
+            // and the seat on turn is a declarer-side seat (declarer plays
+            // dummy's cards; a human dummy plays the hand for a bot declarer).
             let f = inner.table.fold();
             let Some(turn_seat) = f.next_to_act else {
                 return Some(err_msg("rejected", "no one is on turn"));
             };
-            let entitled = turn_seat == seat
+            let entitled = seats.contains(&turn_seat)
                 || f.contract.as_ref().is_some_and(|c| {
                     (turn_seat == c.declarer || turn_seat == c.dummy())
-                        && inner.declarer_side_controller(
+                        && seats.contains(&inner.declarer_side_controller(
                             c.declarer,
                             true,
                             std::time::Instant::now(),
-                        ) == seat
+                        ))
                 });
             if !entitled {
                 return Some(err_msg("rejected", "not your turn"));
             }
-            let was_opening_lead = f.played.is_empty();
             match inner.table.apply(Action::Play {
                 seat: turn_seat,
                 card,
@@ -1049,19 +1165,17 @@ async fn handle_client_msg(
                         "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
                     })
                     .to_string();
+                    // Note: the old opening-lead resync (dummy reveal) is gone —
+                    // hands are un-redacted now, so the opening lead is an
+                    // ordinary card_played with no visibility change.
                     let complete = board_complete_msg(&room.id, &inner);
                     drop(inner);
                     room.broadcast(ev);
-                    // The opening lead reveals dummy to everyone — each
-                    // connection rebuilds its own redacted snapshot.
-                    if was_opening_lead {
-                        room.broadcast_resync();
-                    }
                     if let Some(complete) = complete {
                         room.broadcast(complete);
-                        // A finished board reveals the original deal to
-                        // everyone for review (snapshot() un-redacts at
-                        // Phase::Complete) — push per-viewer snapshots.
+                        // A finished board reveals the original deal for review
+                        // (snapshot shows the complete state) — push a fresh
+                        // snapshot to everyone.
                         room.broadcast_resync();
                     }
                     room.notify_session_lobby();
@@ -1090,9 +1204,9 @@ async fn handle_client_msg(
                     .to_string();
                     drop(inner);
                     room.broadcast(ev);
-                    // A rewind can re-hide info (e.g. undoing the opening
-                    // lead hides dummy again), so every connection rebuilds
-                    // its own redacted snapshot.
+                    // A rewind changes the board state (seq / auction /
+                    // remaining cards), so every connection reloads a fresh
+                    // snapshot.
                     room.broadcast_resync();
                     room.notify_session_lobby();
                     crate::bots::kick(room.clone());
@@ -1102,15 +1216,18 @@ async fn handle_client_msg(
             }
         }
         Some("ready_next_board") => {
-            let Some(seat) = seat else {
+            if seats.is_empty() {
                 return Some(err_msg("not_seated", "kibitzers cannot ready up"));
-            };
+            }
             let Some(session) = session else {
                 return Some(err_msg("no_session", "the demo table has no board rounds"));
             };
             let ev = {
                 let mut inner = room.state.lock().await;
-                inner.ready.insert(seat);
+                // A connection may hold several seats — ready them all.
+                for s in seats {
+                    inner.ready.insert(*s);
+                }
                 json!({
                     "t": "event",
                     "table_id": room.id,
@@ -1133,7 +1250,7 @@ async fn handle_client_msg(
             // Deal-source controls (roadmap Phase 2). Demo room only: any
             // seated player may re-deal; session boards stay owned by the
             // teacher console's round flow.
-            if seat.is_none() {
+            if seats.is_empty() {
                 return Some(err_msg("not_seated", "kibitzers cannot deal"));
             }
             if session.is_some() {
@@ -1281,16 +1398,20 @@ mod tests {
         let room = crate::rooms::Room::new_for_test("t1");
         let mut inner = room.state.try_lock().unwrap();
         inner.seat_or_rebind("u1", "Alice");
-        let msg = snapshot_msg("t1", &inner, Some(Direction::South), false);
+        let msg = snapshot_msg("t1", &inner, &json!([]));
         let v: Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(v["t"], "snapshot");
         assert_eq!(v["table_id"], "t1");
-        assert_eq!(v["state"]["your_seat"], "S");
+        // Un-redacted: every seat is fully visible now.
+        assert_eq!(v["state"]["hands"]["S"]["visible"], true);
+        assert_eq!(v["state"]["hands"]["N"]["visible"], true);
         // Seats travel with every snapshot so late joiners see who is
         // human vs bot without waiting for a seat_update event.
         assert_eq!(v["seats"]["S"]["kind"], "human");
         assert_eq!(v["seats"]["S"]["name"], "Alice");
         assert_eq!(v["seats"]["W"]["kind"], "empty");
+        // And the roster rides along.
+        assert!(v["roster"].is_array());
     }
 
     #[test]

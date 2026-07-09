@@ -102,9 +102,20 @@ async fn create_session(
         Ok(k) => k,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let seat_policy = match SeatPolicy::from_value(&req.seat_policy) {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::BAD_REQUEST, format!("seat_policy: {e}")),
+    // Default seat policy is kind-aware: an adhoc (friends-table) session
+    // defaults to Manual so unassigned joiners WAIT until the host seats them
+    // (drag/invite model); teacher_set keeps the first-free auto-fill default.
+    // An explicit seat_policy always wins.
+    let seat_policy = if req.seat_policy.is_null() {
+        match kind {
+            SessionKind::Adhoc => SeatPolicy::Manual,
+            SessionKind::TeacherSet => SeatPolicy::FirstFree,
+        }
+    } else {
+        match SeatPolicy::from_value(&req.seat_policy) {
+            Ok(p) => p,
+            Err(e) => return err(StatusCode::BAD_REQUEST, format!("seat_policy: {e}")),
+        }
     };
     // An empty board set is allowed: the session starts idle (no deal
     // loaded) and the teacher sends a source later via `load_boards`

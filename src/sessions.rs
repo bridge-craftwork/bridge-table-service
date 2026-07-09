@@ -232,6 +232,23 @@ pub struct Kibitzer {
     pub parked: bool,
 }
 
+/// One live websocket connection, keyed in `Session::connections` by its
+/// opaque per-connection `token` (a random id minted at connect, unrelated
+/// to `sub` — the client never sees `sub`). Tracked so the host roster can
+/// list every human connection (seated, waiting, OR the unseated host), and
+/// so `assign_seat`'s token-addressed "place/Sit" can resolve a token back
+/// to the participant it should seat.
+#[derive(Debug, Clone)]
+pub struct ConnMeta {
+    /// Ticket subject (stable participant identity — used for seats/reconnect).
+    pub sub: String,
+    pub name: String,
+    /// Socket currently live? A seated participant whose socket dropped stays
+    /// in the registry (connected=false) so the roster greys them while the
+    /// zombie-seat grace runs.
+    pub connected: bool,
+}
+
 /// The session's loaded board set. `index` is the lockstep teacher pointer
 /// (0-based current board, forced onto every table by `deal_index_to_all`).
 /// An empty `boards` = idle: no deal loaded yet, rooms hold a throwaway
@@ -287,6 +304,11 @@ pub struct Session {
     /// Round-robin cursor distributing arrivals across tables.
     next_arrival: AtomicUsize,
     pub kibitzers: Mutex<HashMap<String, Kibitzer>>,
+    /// Live connections keyed by opaque per-connection token. The roster is
+    /// built from this (one entry per human connection, seated or waiting or
+    /// the unseated host); `assign_seat` place-by-token resolves here. Leaf
+    /// lock — never held across a room lock.
+    pub connections: Mutex<HashMap<String, ConnMeta>>,
 }
 
 /// Where an arriving connection ends up. Always bound to a room (a lobby member
@@ -343,6 +365,7 @@ impl Session {
                 notify,
                 next_arrival: AtomicUsize::new(0),
                 kibitzers: Mutex::new(HashMap::new()),
+                connections: Mutex::new(HashMap::new()),
             }
         })
     }
@@ -466,6 +489,116 @@ impl Session {
         None
     }
 
+    /// Every room+seat currently bound to `sub` (a connection may hold
+    /// MULTIPLE seats — friends-table multi-seat). Snapshots rooms first,
+    /// then locks one at a time.
+    pub async fn find_all_seated(&self, sub: &str) -> Vec<(Arc<Room>, Direction)> {
+        let mut out = Vec::new();
+        for room in self.rooms_snapshot().await {
+            let inner = room.state.lock().await;
+            for (&seat, occ) in inner.seats.iter() {
+                if occ.sub == sub {
+                    out.push((room.clone(), seat));
+                }
+            }
+        }
+        out
+    }
+
+    /// The seats (directions only) `sub` occupies across the whole session.
+    pub async fn seats_of(&self, sub: &str) -> Vec<Direction> {
+        self.find_all_seated(sub)
+            .await
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    // ── Connection registry (opaque tokens) ─────────────────────────────────
+
+    /// Register (or re-register on reconnect) a live connection under its
+    /// opaque `token`. Any prior entry for the same `sub` is dropped first so
+    /// a participant is one roster entry — a reconnect mints a fresh token and
+    /// supersedes the stale (disconnected) one.
+    pub async fn register_conn(&self, token: &str, sub: &str, name: &str) {
+        let mut c = self.connections.lock().await;
+        c.retain(|t, m| t == token || m.sub != sub);
+        c.insert(
+            token.to_string(),
+            ConnMeta {
+                sub: sub.to_string(),
+                name: name.to_string(),
+                connected: true,
+            },
+        );
+    }
+
+    /// Mark a connection's socket dropped (kept in the registry so a zombie
+    /// seat still shows the greyed occupant in the roster).
+    pub async fn mark_conn_disconnected(&self, token: &str) {
+        if let Some(m) = self.connections.lock().await.get_mut(token) {
+            m.connected = false;
+        }
+    }
+
+    /// Forget a connection entirely (a waiter/kibitzer who left).
+    pub async fn remove_conn(&self, token: &str) {
+        self.connections.lock().await.remove(token);
+    }
+
+    /// Resolve an opaque token to its (sub, name), for `assign_seat`
+    /// place/Sit-by-token.
+    pub async fn conn_meta(&self, token: &str) -> Option<(String, String)> {
+        self.connections
+            .lock()
+            .await
+            .get(token)
+            .map(|m| (m.sub.clone(), m.name.clone()))
+    }
+
+    /// The shared roster: one entry per live human connection — seated,
+    /// waiting, or the unseated host — keyed by opaque token. Empty `seats`
+    /// = a waiter/kibitzer. This is the arrangement the host UI drags and
+    /// that rides in every welcome/snapshot plus the `roster_update` event.
+    /// Locks rooms sequentially then the connections leaf — never call while
+    /// holding a room lock.
+    pub async fn roster_json(&self) -> Value {
+        let rooms = self.rooms_snapshot().await;
+        let mut seats_by_sub: HashMap<String, Vec<String>> = HashMap::new();
+        for room in &rooms {
+            let inner = room.state.lock().await;
+            for seat in Direction::ALL {
+                if let Some(occ) = inner.seats.get(&seat) {
+                    seats_by_sub
+                        .entry(occ.sub.clone())
+                        .or_default()
+                        .push(seat.to_char().to_string());
+                }
+            }
+        }
+        let conns = self.connections.lock().await;
+        let mut entries: Vec<(String, String, Value)> = conns
+            .iter()
+            .map(|(token, m)| {
+                let mut seats = seats_by_sub.get(&m.sub).cloned().unwrap_or_default();
+                seats.sort();
+                (
+                    m.name.clone(),
+                    token.clone(),
+                    json!({
+                        "token": token,
+                        "name": m.name,
+                        "connected": m.connected,
+                        "seats": seats,
+                    }),
+                )
+            })
+            .collect();
+        // Stable order for the host UI (name, then token as tiebreak).
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        Value::Array(entries.into_iter().map(|(_, _, v)| v).collect())
+    }
+
     /// The primary seat to use in a brand-new (empty) table for a shape.
     fn first_seat_of(shape: &SeatPolicy) -> Direction {
         match shape {
@@ -573,6 +706,19 @@ impl Session {
     /// (creating a table if needed) unless `wait_to_seat` / Manual holds them
     /// in the waiting lobby.
     pub async fn place(&self, sub: &str, name: &str) -> Placement {
+        self.place_seat(sub, name, None).await
+    }
+
+    /// `place` with an optional requested seat (backs the `?seat=N` invite
+    /// link, carried in `hello.seat`). Under Manual policy a free requested
+    /// seat is taken directly instead of waiting; otherwise the request is
+    /// ignored and normal placement applies.
+    pub async fn place_seat(
+        &self,
+        sub: &str,
+        name: &str,
+        requested: Option<Direction>,
+    ) -> Placement {
         // Serialize placement: simultaneous arrivals (e.g. spawned test tabs)
         // otherwise race to create tables / grab seats, scattering the fill.
         let _seat_guard = self.seating.lock().await;
@@ -629,8 +775,19 @@ impl Session {
                 };
             }
         }
-        // 3. New arrival: auto-seat unless waiting-room / manual.
+        // 2.75. `?seat=` invite: under Manual policy, a free requested seat is
+        //   taken directly (this backs the invite link). If it's occupied,
+        //   fall through to the normal waiting-lobby path.
         let policy = self.seat_policy();
+        if let (Some(req), SeatPolicy::Manual) = (requested, &policy) {
+            if let Some((room, seat)) = self.try_seat_specific(req, sub, name).await {
+                return Placement {
+                    room,
+                    seat: Some(seat),
+                };
+            }
+        }
+        // 3. New arrival: auto-seat unless waiting-room / manual.
         let auto =
             !self.wait_to_seat.load(Ordering::SeqCst) && !matches!(policy, SeatPolicy::Manual);
         if auto {
@@ -654,6 +811,24 @@ impl Session {
         match rooms.first() {
             Some(r) => r.clone(),
             None => self.add_room().await,
+        }
+    }
+
+    /// Seat `sub` at a specific `seat` in the first table (creating one if
+    /// none exist). None if that seat is already taken. Backs the `?seat=`
+    /// invite under Manual policy.
+    async fn try_seat_specific(
+        &self,
+        seat: Direction,
+        sub: &str,
+        name: &str,
+    ) -> Option<(Arc<Room>, Direction)> {
+        let rooms = self.rooms_snapshot().await;
+        let room = self.watch_table(&rooms).await;
+        if room.state.lock().await.try_seat(seat, sub, name) {
+            Some((room, seat))
+        } else {
+            None
         }
     }
 
@@ -698,76 +873,127 @@ impl Session {
         changed
     }
 
-    /// Teacher seat control. `sub = None` vacates the seat (boot); a booted
-    /// connected human becomes a kibitzer of the same table. `sub = Some`
-    /// moves a known participant (seated anywhere in the session, or
-    /// kibitzing) into the seat, preserving their connected state.
-    /// Returns the rooms whose seats changed (for seat_update broadcasts); the
-    /// caller sends RECHECK + lobby refresh. A booted/displaced live human is
-    /// **parked** in the lobby (never auto-reseated).
+    /// Host seat control (seat/token-addressed — the friends-table model).
+    /// `table_id` selects the table (defaults to the first table when None,
+    /// for the common single-table case). Dispatch by which fields are set:
+    ///
+    /// - **vacate**: `from = Some(seat)`, `target = None` — the occupant of
+    ///   `from` becomes waiting (parked kibitzer, kept CONNECTED, not
+    ///   disconnected), unless they still hold other seats.
+    /// - **move / swap**: `from = Some(seat)`, `target = Some(seat)` — move
+    ///   `from`'s occupant into `target`; if `target` is held by a different
+    ///   connection the two SWAP.
+    /// - **place / Sit / seat-a-waiter**: `token = Some(..)`,
+    ///   `target = Some(seat)` — seat that token's connection at `target`
+    ///   (how the host seats a waiter, or Sits itself with its own token).
+    ///   A different occupant already at `target` is displaced to waiting.
+    ///   The connection MAY thereby hold multiple seats.
+    ///
+    /// Returns the rooms whose seats changed (for seat_update); the caller
+    /// broadcasts roster_update + RECHECK + lobby refresh. A displaced live
+    /// human is **parked** (never auto-reseated).
     pub async fn assign_seat(
         &self,
-        table_id: &str,
-        seat: Direction,
-        sub: Option<&str>,
+        table_id: Option<&str>,
+        target: Option<Direction>,
+        from: Option<Direction>,
+        token: Option<&str>,
     ) -> Result<Vec<Arc<Room>>, String> {
         let rooms = self.rooms_snapshot().await;
-        let Some(target) = rooms.iter().find(|r| r.id == table_id).cloned() else {
-            return Err(format!("unknown table {table_id}"));
+        let room = match table_id {
+            Some(id) => rooms
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .ok_or_else(|| format!("unknown table {id}"))?,
+            None => rooms.first().cloned().ok_or("no tables in session")?,
         };
 
-        let Some(sub) = sub else {
-            // Vacate (boot). The seat becomes a bot; a booted live human is
-            // parked in the lobby watching this table.
-            let removed = target.state.lock().await.vacate(seat);
-            let Some(occ) = removed else {
-                return Ok(vec![]); // already empty — nothing changed
-            };
-            if occ.connected {
-                self.add_lobby(&occ.sub, &occ.name, Some(target.id.clone()), true)
-                    .await;
+        match (from, target, token) {
+            // ── vacate ──────────────────────────────────────────────────────
+            (Some(f), None, _) => {
+                let removed = room.state.lock().await.vacate(f);
+                let Some(occ) = removed else {
+                    return Ok(vec![]); // already empty — nothing changed
+                };
+                // Still seated elsewhere (multi-seat)? Then not a waiter.
+                if occ.connected && self.seats_of(&occ.sub).await.is_empty() {
+                    self.add_lobby(&occ.sub, &occ.name, Some(room.id.clone()), true)
+                        .await;
+                }
+                Ok(vec![room])
             }
-            return Ok(vec![target.clone()]);
-        };
-
-        // Fast pre-check so we don't yank someone out of their seat only to
-        // find the target taken (the re-check at insert handles races).
-        if target.state.lock().await.seats.contains_key(&seat) {
-            return Err("seat is occupied — boot it first".into());
-        }
-
-        // Pull the participant out of wherever they are.
-        let (occ, mut changed) = if let Some((old_room, old_seat)) = self.find_seated(sub).await {
-            match old_room.state.lock().await.vacate(old_seat) {
-                Some(occ) => (occ, vec![old_room.clone()]),
-                None => return Err(format!("participant {sub} moved concurrently")),
+            // ── move / swap ─────────────────────────────────────────────────
+            (Some(f), Some(t), _) => {
+                if f == t {
+                    return Ok(vec![]);
+                }
+                let mut inner = room.state.lock().await;
+                let Some(from_occ) = inner.seats.get(&f).cloned() else {
+                    return Err(format!("seat {f:?} is empty"));
+                };
+                match inner.seats.get(&t).cloned() {
+                    Some(target_occ) => {
+                        // Swap the two occupants.
+                        inner.vacate(f);
+                        inner.vacate(t);
+                        inner.try_place(t, from_occ);
+                        inner.try_place(f, target_occ);
+                    }
+                    None => {
+                        inner.vacate(f);
+                        inner.try_place(t, from_occ);
+                    }
+                }
+                drop(inner);
+                Ok(vec![room])
             }
-        } else if let Some(k) = self.kibitzers.lock().await.remove(sub) {
-            (
-                crate::rooms::Occupant {
-                    sub: sub.to_string(),
-                    name: k.name,
-                    connected: true,
-                    disconnected_at: None,
-                },
-                vec![],
-            )
-        } else {
-            return Err(format!("unknown participant {sub}"));
-        };
-
-        let mut inner = target.state.lock().await;
-        if inner.try_place(seat, occ.clone()) {
-            drop(inner);
-            changed.push(target.clone());
-            Ok(changed)
-        } else {
-            // Lost the race for the seat: park them in the lobby so they aren't
-            // dropped from the session.
-            drop(inner);
-            self.add_lobby(&occ.sub, &occ.name, Some(target.id.clone()), true)
-                .await;
-            Err("seat is occupied — boot it first".into())
+            // ── place / Sit / seat-a-waiter (by token) ──────────────────────
+            (None, Some(t), Some(tok)) => {
+                let Some((sub, name)) = self.conn_meta(tok).await else {
+                    return Err(format!("unknown connection token {tok}"));
+                };
+                // Already this connection at the target? No-op.
+                if room
+                    .state
+                    .lock()
+                    .await
+                    .seats
+                    .get(&t)
+                    .is_some_and(|o| o.sub == sub)
+                {
+                    return Ok(vec![]);
+                }
+                // Being seated → no longer a waiter.
+                self.kibitzers.lock().await.remove(&sub);
+                // Displace any different occupant of the target to waiting.
+                let displaced = {
+                    let mut inner = room.state.lock().await;
+                    let d = if inner.seats.contains_key(&t) {
+                        inner.vacate(t)
+                    } else {
+                        None
+                    };
+                    inner.try_place(
+                        t,
+                        crate::rooms::Occupant {
+                            sub: sub.clone(),
+                            name: name.clone(),
+                            connected: true,
+                            disconnected_at: None,
+                        },
+                    );
+                    d
+                };
+                if let Some(d) = displaced {
+                    if d.connected && self.seats_of(&d.sub).await.is_empty() {
+                        self.add_lobby(&d.sub, &d.name, Some(room.id.clone()), true)
+                            .await;
+                    }
+                }
+                Ok(vec![room])
+            }
+            _ => Err("assign_seat needs `from`, or `token`+`seat`".into()),
         }
     }
 
@@ -1031,6 +1257,9 @@ impl Session {
                 })
                 .collect()
         };
+        // The shared, token-keyed roster (also on every welcome/snapshot and
+        // the roster_update event) so the host console can drag seats.
+        let roster = self.roster_json().await;
         json!({
             "t": "lobby",
             "session_id": self.id,
@@ -1049,6 +1278,7 @@ impl Session {
             },
             "tables": tables,
             "kibitzers": kibitzers,
+            "roster": roster,
         })
         .to_string()
     }
@@ -1406,38 +1636,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assign_seat_moves_kibitzers_and_seated_players() {
-        let s = session(SessionKind::TeacherSet, SeatPolicy::Manual, 2);
-        s.place("g1", "Ann").await; // kibitzer
+    async fn assign_seat_places_by_token_moves_and_swaps() {
+        let s = session(SessionKind::TeacherSet, SeatPolicy::Manual, 1);
+        s.register_conn("tok1", "g1", "Ann").await;
+        s.place("g1", "Ann").await; // waiting (manual)
 
-        // Kibitzer → seat.
-        let changed = s.assign_seat("s1-t2", South, Some("g1")).await.unwrap();
-        assert_eq!(ids(&changed), vec!["s1-t2"]);
-        assert_eq!(seated_at(&s, "g1").await, Some(("s1-t2".into(), South)));
-        assert!(!s.kibitzers.lock().await.contains_key("g1"));
-
-        // Seated → different table (both rooms report a change).
-        let changed = s.assign_seat("s1-t1", North, Some("g1")).await.unwrap();
-        assert_eq!(ids(&changed), vec!["s1-t2", "s1-t1"]);
-        assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), North)));
-
-        // Occupied target rejected without unseating anyone.
-        s.place("g2", "Ben").await; // kibitzer
-        let err = s
-            .assign_seat("s1-t1", North, Some("g2"))
+        // Place-by-token: seat the waiter's connection at South.
+        let changed = s
+            .assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"))
             .await
-            .err()
             .unwrap();
-        assert!(err.contains("occupied"), "{err}");
+        assert_eq!(ids(&changed), vec!["s1-t1"]);
+        assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), South)));
+        assert!(!s.kibitzers.lock().await.contains_key("g1"), "no longer waiting");
+
+        // Move South → North (target empty).
+        s.assign_seat(Some("s1-t1"), Some(North), Some(South), None)
+            .await
+            .unwrap();
         assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), North)));
 
-        // Unknown participant / table rejected.
-        assert!(s.assign_seat("s1-t1", South, Some("nope")).await.is_err());
-        assert!(s.assign_seat("s1-t9", South, Some("g2")).await.is_err());
+        // A second connection seated at South, then move North→South SWAPS.
+        s.register_conn("tok2", "g2", "Ben").await;
+        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok2"))
+            .await
+            .unwrap();
+        s.assign_seat(Some("s1-t1"), Some(South), Some(North), None)
+            .await
+            .unwrap();
+        assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), South)));
+        assert_eq!(seated_at(&s, "g2").await, Some(("s1-t1".into(), North)));
+
+        // Unknown token rejected; missing from+token+target rejected.
+        assert!(s
+            .assign_seat(Some("s1-t1"), Some(East), None, Some("nope"))
+            .await
+            .is_err());
+        assert!(s.assign_seat(Some("s1-t1"), None, None, None).await.is_err());
     }
 
     #[tokio::test]
-    async fn boot_vacates_and_keeps_the_human_as_kibitzer() {
+    async fn one_connection_can_hold_multiple_seats() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
+        s.register_conn("tok1", "g1", "Ann").await;
+        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"))
+            .await
+            .unwrap();
+        s.assign_seat(Some("s1-t1"), Some(North), None, Some("tok1"))
+            .await
+            .unwrap();
+        let mut seats = s.seats_of("g1").await;
+        seats.sort_by_key(|d| d.to_char());
+        assert_eq!(seats, vec![North, South]);
+        // The roster shows both seats under the single token.
+        let roster = s.roster_json().await;
+        let entry = roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["token"] == "tok1")
+            .unwrap();
+        assert_eq!(entry["seats"].as_array().unwrap().len(), 2);
+        assert_eq!(entry["name"], "Ann");
+        assert_eq!(entry["connected"], true);
+    }
+
+    #[tokio::test]
+    async fn vacate_parks_the_human_as_waiter() {
         let s = session(
             SessionKind::TeacherSet,
             SeatPolicy::OnePerSeat(vec![South]),
@@ -1445,13 +1710,17 @@ mod tests {
         );
         s.place("g1", "Ann").await;
         {
-            // A ready flag must not survive the boot.
+            // A ready flag must not survive the vacate.
             room_at(&s, 0).await.state.lock().await.ready.insert(South);
         }
-        let changed = s.assign_seat("s1-t1", South, None).await.unwrap();
+        // Vacate = from set, target None.
+        let changed = s
+            .assign_seat(Some("s1-t1"), None, Some(South), None)
+            .await
+            .unwrap();
         assert_eq!(ids(&changed), vec!["s1-t1"]);
         assert_eq!(s.find_seated("g1").await.map(|(_, seat)| seat), None);
-        // Booted → parked in the lobby (never auto-reseated).
+        // Vacated → parked in the lobby (never auto-reseated).
         assert_eq!(
             s.kibitzers.lock().await.get("g1").map(|k| k.parked),
             Some(true)
@@ -1461,9 +1730,9 @@ mod tests {
         assert!(inner.seats.is_empty());
         assert!(inner.ready.is_empty());
         drop(inner);
-        // Booting an empty seat is a no-op.
+        // Vacating an empty seat is a no-op.
         assert!(s
-            .assign_seat("s1-t1", South, None)
+            .assign_seat(Some("s1-t1"), None, Some(South), None)
             .await
             .unwrap()
             .is_empty());
@@ -1555,7 +1824,9 @@ mod tests {
     async fn parked_member_is_not_auto_seated() {
         let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
         s.place("g1", "Ann").await; // South
-        s.assign_seat("s1-t1", South, None).await.unwrap(); // boot → parked
+        s.assign_seat(Some("s1-t1"), None, Some(South), None)
+            .await
+            .unwrap(); // vacate → parked
         assert_eq!(
             s.kibitzers.lock().await.get("g1").map(|k| k.parked),
             Some(true)
