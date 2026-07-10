@@ -797,7 +797,10 @@ mod tests {
         use Direction::*;
         // Only South is human; the auction so far is all bot seats (N, E).
         let mut inner = inner_with(&["u1"]); // u1 → South
-        bid(&mut inner, &[(North, Call::from_pbn("1S").unwrap()), (East, Call::Pass)]);
+        bid(
+            &mut inner,
+            &[(North, Call::from_pbn("1S").unwrap()), (East, Call::Pass)],
+        );
         assert_eq!(inner.last_human_action_seq(Instant::now()), None);
     }
 
