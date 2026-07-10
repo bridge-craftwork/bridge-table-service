@@ -16,8 +16,12 @@
 //!                    host only: {"t":"open_boards","count":N} |
 //!                    seat/token-addressed seat control (friends-table model):
 //!                    {"t":"assign_seat","table"?:ID,"seat":"S"|null,
-//!                        "from"?:"N","token"?:TOKEN}  (move | vacate | place) |
+//!                        "from"?:"N","token"?:TOKEN,"bot"?:bool}
+//!                        (move | vacate | place; vacate `bot:true`=Seat a bot,
+//!                        else Remove→EMPTY/open) |
 //!                    {"t":"boot","table"?:ID,"seat":"S"}  (vacate alias) |
+//!                    {"t":"kick","token":TOKEN}  (remove a person entirely) |
+//!                    {"t":"set_pass_sides","sides":["NS","EW"]}  (PassBot) |
 //!                    {"t":"force_advance","table":ID} |
 //!                    {"t":"kibitz","table":ID} |
 //!                    runtime deal source + lockstep board nav (§Phase 3.1):
@@ -111,6 +115,7 @@ fn snapshot_msg(room_id: &str, inner: &crate::rooms::RoomInner, roster: &Value) 
             .snapshot(inner.board_mode == crate::rooms::BoardMode::BidOnly),
         "board_mode": inner.board_mode.as_str(),
         "seats": inner.seats_json(),
+        "pass_sides": inner.pass_sides_json(),
         "roster": roster,
     })
     .to_string()
@@ -139,6 +144,7 @@ fn seats_event(room: &Room, inner: &crate::rooms::RoomInner) -> String {
         "seq": inner.table.seq(),
         "kind": "seat_update",
         "seats": inner.seats_json(),
+        "pass_sides": inner.pass_sides_json(),
     })
     .to_string()
 }
@@ -316,6 +322,8 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
                             }
                         }
                     }
+                    // The host kicked this person off the table entirely.
+                    Ok(m) if m.strip_prefix("KICK:").is_some_and(|s| s == ticket.sub) => break,
                     Ok(_) => {} // LOBBY etc.: teacher-only concerns
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(_) => break,
@@ -652,6 +660,8 @@ fn is_host_control(v: &Value) -> bool {
             | Some("pause_bots")
             | Some("assign_seat")
             | Some("boot")
+            | Some("kick")
+            | Some("set_pass_sides")
     )
 }
 
@@ -814,15 +824,21 @@ async fn handle_teacher_msg(
                     v["token"].as_str(),
                 )
             };
-            match session.assign_seat(table, target, from, token).await {
+            // Vacate target: `bot:true` = Seat a bot; else Remove → EMPTY (open,
+            // game pauses on that seat until filled).
+            let seat_bot = v["bot"].as_bool().unwrap_or(false);
+            match session
+                .assign_seat(table, target, from, token, seat_bot)
+                .await
+            {
                 Ok(changed) => {
                     for room in changed {
                         let inner = room.state.lock().await;
                         let ev = seats_event(&room, &inner);
                         drop(inner);
                         room.broadcast(ev);
-                        // A vacated seat is a bot now; a filled one may
-                        // unblock the table.
+                        // A filled/bot seat may unblock the table; an empty seat
+                        // pauses it (the driver no-ops on an empty seat).
                         crate::bots::kick(room.clone());
                     }
                     broadcast_roster(session).await;
@@ -832,6 +848,51 @@ async fn handle_teacher_msg(
                 }
                 Err(e) => Some(err_msg("rejected", &e)),
             }
+        }
+        // Uninvite/kick: remove a person from the table entirely (by token).
+        Some("kick") => {
+            let Some(token) = v["token"].as_str() else {
+                return Some(err_msg("bad_kick", "kick needs a connection token"));
+            };
+            match session.kick(token).await {
+                Ok(changed) => {
+                    for room in changed {
+                        let inner = room.state.lock().await;
+                        let ev = seats_event(&room, &inner);
+                        drop(inner);
+                        room.broadcast(ev);
+                        crate::bots::kick(room.clone());
+                    }
+                    broadcast_roster(session).await;
+                    session.notify_recheck();
+                    session.notify_lobby();
+                    None
+                }
+                Err(e) => Some(err_msg("rejected", &e)),
+            }
+        }
+        // PassBot: set which sides' bots always pass, e.g. {sides:["EW"]}.
+        Some("set_pass_sides") => {
+            let mut sides = std::collections::HashSet::new();
+            if let Some(arr) = v["sides"].as_array() {
+                for s in arr {
+                    if let Some(side) = s.as_str().and_then(crate::sessions::Side::from_key) {
+                        sides.insert(side);
+                    }
+                }
+            }
+            session.set_pass_sides(sides).await;
+            // Re-broadcast seats (carry the new pass_sides) and re-kick so a
+            // now-passing bot acts (or a no-longer-passing one bids via BBA).
+            for room in session.rooms_snapshot().await {
+                let inner = room.state.lock().await;
+                let ev = seats_event(&room, &inner);
+                drop(inner);
+                room.broadcast(ev);
+                crate::bots::kick(room.clone());
+            }
+            session.notify_recheck();
+            None
         }
         Some("undo") => {
             // Teacher undo applies to the kibitzed table.
@@ -1054,9 +1115,11 @@ async fn handle_client_msg(
         Some("pong") => None,
         // Host-only frames are routed away for hosts; if a non-host sends one
         // it lands here → refuse.
-        Some("assign_seat") | Some("boot") | Some("force_advance") => {
-            Some(err_msg("not_host", "seat management is host-only"))
-        }
+        Some("assign_seat")
+        | Some("boot")
+        | Some("force_advance")
+        | Some("kick")
+        | Some("set_pass_sides") => Some(err_msg("not_host", "seat management is host-only")),
         Some("bid") => {
             if seats.is_empty() {
                 return Some(err_msg("not_seated", "kibitzers cannot bid"));
@@ -1438,7 +1501,9 @@ mod tests {
         // human vs bot without waiting for a seat_update event.
         assert_eq!(v["seats"]["S"]["kind"], "human");
         assert_eq!(v["seats"]["S"]["name"], "Alice");
-        assert_eq!(v["seats"]["W"]["kind"], "empty");
+        // An absent, un-removed seat is a bot (default); host Remove would make
+        // it "empty" (open, no bot).
+        assert_eq!(v["seats"]["W"]["kind"], "bot");
         // And the roster rides along.
         assert!(v["roster"].is_array());
     }
