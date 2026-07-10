@@ -891,6 +891,10 @@ async fn handle_teacher_msg(
             // Re-broadcast seats (carry the new pass_sides) and re-kick so a
             // now-passing bot acts (or a no-longer-passing one bids via BBA).
             for room in session.rooms_snapshot().await {
+                // Drop the cached BBA prediction: it may have been built while a
+                // side was passing (its calls[0] could be that pass), and the
+                // continuation prefix guard won't catch it once we switch off.
+                *room.bba_cache.lock().await = None;
                 let inner = room.state.lock().await;
                 let ev = seats_event(&room, &inner);
                 drop(inner);
@@ -1313,6 +1317,14 @@ async fn handle_client_msg(
                     })
                     .to_string();
                     drop(inner);
+                    // A rewind INVALIDATES the cached BBA prediction:
+                    // `continuation()` guards against divergence but not a
+                    // rewind to a SHORTER prefix (an empty prefix matches any
+                    // cache), so a stale prediction — e.g. one that began with
+                    // a PassBot pass — would be re-served (a bot "passes" from
+                    // the old auction). Drop it so the next bot bid re-requests
+                    // BBA fresh.
+                    *room.bba_cache.lock().await = None;
                     room.broadcast(ev);
                     // A rewind changes the board state (seq / auction /
                     // remaining cards), so every connection reloads a fresh
