@@ -358,6 +358,34 @@ impl RoomInner {
         self.table.board_result_json()
     }
 
+    /// The seq to rewind to for "undo to the last human action": the index
+    /// of the most recent action (bid OR card play) in the log whose ACTOR
+    /// seat is currently human-controlled. Rewinding `undo_to` to this seq
+    /// drops that action and everything after it, leaving the human seat on
+    /// turn (so the bot driver, which only acts for bot-controlled seats,
+    /// won't immediately replay it).
+    ///
+    /// "Human-controlled" uses CURRENT occupancy via `seat_bot_controlled`
+    /// (on-turn grace): a connected occupant is human; an empty seat, or one
+    /// whose occupant disconnected past the takeover grace, is a bot. This is
+    /// deliberately the inverse of the bot-driver's own control test, so the
+    /// seat we rewind to is by construction one the driver will wait on.
+    ///
+    /// Returns None when no logged action was performed by a human-controlled
+    /// seat (nobody human has acted yet on this board, or every seat is a bot).
+    pub fn last_human_action_seq(&self, now: Instant) -> Option<usize> {
+        for (i, action) in self.table.actions.iter().enumerate().rev() {
+            let seat = match action {
+                crate::table::Action::Call { seat, .. } => *seat,
+                crate::table::Action::Play { seat, .. } => *seat,
+            };
+            if !self.seat_bot_controlled(seat, true, now) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     pub fn seat_bot_controlled(&self, seat: Direction, on_turn: bool, now: Instant) -> bool {
         let Some(occ) = self.seats.get(&seat) else {
             return true; // empty seat: always a bot
@@ -740,5 +768,100 @@ mod tests {
         // (mode check, not a re-seat — the binding never moved).
         assert_eq!(inner.seat_or_rebind("u1", "u1"), Some(Direction::South));
         assert!(!inner.seat_bot_controlled(Direction::South, true, long_gone));
+    }
+
+    // --- last_human_action_seq (undo-to-last-human) -----------------------
+
+    // Deal the demo board's dealer-N auction 1S-P-P-P into `inner`.
+    fn bid(inner: &mut RoomInner, seq: &[(Direction, Call)]) {
+        use crate::table::Action;
+        for (seat, call) in seq {
+            inner
+                .table
+                .apply(Action::Call {
+                    seat: *seat,
+                    call: call.clone(),
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn last_human_action_none_when_no_actions() {
+        let inner = inner_with(&["u1"]); // South human, no calls yet
+        assert_eq!(inner.last_human_action_seq(Instant::now()), None);
+    }
+
+    #[test]
+    fn last_human_action_none_when_only_bots_acted() {
+        use Direction::*;
+        // Only South is human; the auction so far is all bot seats (N, E).
+        let mut inner = inner_with(&["u1"]); // u1 → South
+        bid(&mut inner, &[(North, Call::from_pbn("1S").unwrap()), (East, Call::Pass)]);
+        assert_eq!(inner.last_human_action_seq(Instant::now()), None);
+    }
+
+    #[test]
+    fn last_human_action_finds_latest_human_seat_across_bot_actions() {
+        use Direction::*;
+        // South is the only human. Auction: N(bot) 1S, E(bot) P, S(human) 2S,
+        // W(bot) P. The most recent human action is South's 2S at index 2, so
+        // we rewind to seq 2 (undoing S's 2S and W's P).
+        let mut inner = inner_with(&["u1"]); // u1 → South
+        bid(
+            &mut inner,
+            &[
+                (North, Call::from_pbn("1S").unwrap()),
+                (East, Call::Pass),
+                (South, Call::from_pbn("2S").unwrap()),
+                (West, Call::Pass),
+            ],
+        );
+        assert_eq!(inner.last_human_action_seq(Instant::now()), Some(2));
+    }
+
+    #[test]
+    fn last_human_action_ignores_seat_vacated_to_bot() {
+        use Direction::*;
+        // South acts, then South is vacated (now a bot). Its earlier action no
+        // longer counts as human — with no other human seat, result is None.
+        let mut inner = inner_with(&["u1"]); // u1 → South
+        bid(
+            &mut inner,
+            &[
+                (North, Call::from_pbn("1S").unwrap()),
+                (East, Call::Pass),
+                (South, Call::from_pbn("2S").unwrap()),
+            ],
+        );
+        assert_eq!(inner.last_human_action_seq(Instant::now()), Some(2));
+        inner.vacate(South);
+        assert_eq!(inner.last_human_action_seq(Instant::now()), None);
+    }
+
+    #[test]
+    fn last_human_action_skips_disconnected_past_grace() {
+        use Direction::*;
+        let mut inner = inner_with(&["u1"]); // u1 → South
+        bid(
+            &mut inner,
+            &[
+                (North, Call::from_pbn("1S").unwrap()),
+                (East, Call::Pass),
+                (South, Call::from_pbn("2S").unwrap()),
+            ],
+        );
+        inner.mark_disconnected("u1");
+        let dropped = inner.seats[&South].disconnected_at.unwrap();
+        // Within grace: still human-driven, still found.
+        assert_eq!(
+            inner.last_human_action_seq(dropped + Duration::from_secs(5)),
+            Some(2)
+        );
+        // Past the on-turn grace: South is a bot now, so no human action.
+        assert_eq!(
+            inner.last_human_action_seq(dropped + Duration::from_secs(61)),
+            None
+        );
     }
 }

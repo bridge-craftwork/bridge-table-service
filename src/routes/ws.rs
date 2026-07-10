@@ -1198,11 +1198,30 @@ async fn handle_client_msg(
         Some("undo") => {
             // Unlimited, any-actor undo (Shark-style) per the project plan;
             // per-table policy knobs come with teacher sessions.
-            let Some(to_seq) = v["to_seq"].as_u64() else {
-                return Some(err_msg("bad_undo", "undo.to_seq missing"));
-            };
+            //
+            // Two shapes:
+            //   {t:"undo", to_seq:N} — explicit rewind to seq N (unchanged;
+            //     used by teacher/kibitz paths).
+            //   {t:"undo"}           — rewind to the last human action: the
+            //     state just before the most recent bid/play by a seat that a
+            //     human currently occupies, so the table waits on that human
+            //     instead of a bot instantly replaying a single-ply undo. Any
+            //     human at the table may trigger it (table-wide, not
+            //     sender-scoped).
             let mut inner = room.state.lock().await;
-            match inner.table.undo_to(to_seq as usize) {
+            let to_seq = match v["to_seq"].as_u64() {
+                Some(n) => n as usize,
+                None => match inner.last_human_action_seq(std::time::Instant::now()) {
+                    Some(seq) => seq,
+                    None => {
+                        return Some(err_msg(
+                            "no_human_action",
+                            "no human has acted on this board yet",
+                        ))
+                    }
+                },
+            };
+            match inner.table.undo_to(to_seq) {
                 Ok(seq) => {
                     let ev = json!({
                         "t": "event",
