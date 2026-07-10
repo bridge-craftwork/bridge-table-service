@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use bridge_types::{Call, Direction, Vulnerability};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
-use crate::sessions::Session;
+use crate::sessions::{Session, Side};
 use crate::table::{BoardSetup, TableState};
 
 /// Zombie-seat policy: how long a disconnected occupant keeps their seat
@@ -209,6 +209,16 @@ pub struct RoomInner {
     /// Bot-takeover grace for this room's seats (see `TakeoverGrace`); set
     /// from the owning session's kind.
     pub takeover: TakeoverGrace,
+    /// Seats the host has explicitly left EMPTY (open, no bot). An absent seat
+    /// is normally bot-driven; a seat in here is nobody's — the table pauses on
+    /// its turn until a human sits or the host seats a bot. Cleared when a seat
+    /// is occupied. This is the third seat state beyond human / bot.
+    pub no_bot: HashSet<Direction>,
+    /// Sides whose BOT seats always pass in the auction (PassBot) instead of
+    /// bidding via BBA. Cardplay is unaffected (still the room's cardplay bot).
+    /// For BBO-style bidding practice where you don't want the opponents
+    /// getting creative. Human seats bid normally regardless.
+    pub pass_sides: HashSet<Side>,
 }
 
 impl Room {
@@ -228,6 +238,8 @@ impl Room {
                 ready: HashSet::new(),
                 board_mode: BoardMode::default(),
                 takeover,
+                no_bot: HashSet::new(),
+                pass_sides: HashSet::new(),
             }),
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
@@ -302,6 +314,7 @@ impl RoomInner {
                     connected: true,
                     disconnected_at: None,
                 });
+                self.no_bot.remove(&seat); // occupied → no longer an open seat
                 return Some(seat);
             }
         }
@@ -329,10 +342,23 @@ impl RoomInner {
         if let std::collections::hash_map::Entry::Vacant(e) = self.seats.entry(seat) {
             e.insert(occ);
             self.ready.remove(&seat);
+            self.no_bot.remove(&seat); // occupied → no longer an open seat
             true
         } else {
             false
         }
+    }
+
+    /// Mark an (already-vacated) seat as EMPTY — open, no bot. The table pauses
+    /// on this seat's turn until someone sits or a bot is placed.
+    pub fn set_empty(&mut self, seat: Direction) {
+        self.no_bot.insert(seat);
+    }
+
+    /// Mark an (already-vacated) seat as BOT — the default absent state. Undoes
+    /// `set_empty` so the bot driver takes the seat.
+    pub fn set_bot(&mut self, seat: Direction) {
+        self.no_bot.remove(&seat);
     }
 
     /// Vacate a seat (teacher boot / assign away). Returns the removed
@@ -429,7 +455,10 @@ impl RoomInner {
 
     pub fn seat_bot_controlled(&self, seat: Direction, on_turn: bool, now: Instant) -> bool {
         let Some(occ) = self.seats.get(&seat) else {
-            return true; // empty seat: always a bot
+            // Absent seat: normally a bot — UNLESS the host marked it empty
+            // (open, no bot), in which case nobody drives it and the table
+            // pauses on its turn until someone sits.
+            return !self.no_bot.contains(&seat);
         };
         if occ.connected {
             return false;
@@ -452,11 +481,24 @@ impl RoomInner {
                     "name": o.name,
                     "connected": o.connected,
                 }),
-                None => serde_json::json!({ "kind": "empty" }),
+                // Absent: a bot by default, or "empty" (open, no bot) if the
+                // host removed the occupant without seating a bot.
+                None if self.no_bot.contains(&seat) => serde_json::json!({ "kind": "empty" }),
+                None => serde_json::json!({ "kind": "bot" }),
             };
             m.insert(seat.to_char().to_string(), v);
         }
         serde_json::Value::Object(m)
+    }
+
+    /// Sides whose bots always pass (PassBot), as `["NS","EW"]` for the client.
+    pub fn pass_sides_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.pass_sides
+                .iter()
+                .map(|s| serde_json::Value::String(s.key().to_string()))
+                .collect(),
+        )
     }
 }
 
@@ -688,6 +730,8 @@ mod tests {
             ready: HashSet::new(),
             board_mode: BoardMode::default(),
             takeover: TakeoverGrace::DEFAULT,
+            no_bot: HashSet::new(),
+            pass_sides: HashSet::new(),
         };
         assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
         assert_eq!(inner.seat_or_rebind("u2", "Bob"), Some(Direction::West));
@@ -707,6 +751,8 @@ mod tests {
             ready: HashSet::new(),
             board_mode: BoardMode::default(),
             takeover: TakeoverGrace::DEFAULT,
+            no_bot: HashSet::new(),
+            pass_sides: HashSet::new(),
         };
         for sub in subs {
             inner.seat_or_rebind(sub, sub);

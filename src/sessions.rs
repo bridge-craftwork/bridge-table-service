@@ -76,7 +76,7 @@ impl SessionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     NS,
     EW,
@@ -89,6 +89,29 @@ impl Side {
         match self {
             Side::NS => [Direction::South, Direction::North],
             Side::EW => [Direction::West, Direction::East],
+        }
+    }
+
+    /// The side a seat belongs to.
+    pub fn of(dir: Direction) -> Side {
+        match dir {
+            Direction::North | Direction::South => Side::NS,
+            Direction::East | Direction::West => Side::EW,
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Side> {
+        match key {
+            "NS" => Some(Side::NS),
+            "EW" => Some(Side::EW),
+            _ => None,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Side::NS => "NS",
+            Side::EW => "EW",
         }
     }
 }
@@ -964,6 +987,7 @@ impl Session {
         target: Option<Direction>,
         from: Option<Direction>,
         token: Option<&str>,
+        seat_bot: bool,
     ) -> Result<Vec<Arc<Room>>, String> {
         let rooms = self.rooms_snapshot().await;
         let room = match table_id {
@@ -976,18 +1000,32 @@ impl Session {
         };
 
         match (from, target, token) {
-            // ── vacate ──────────────────────────────────────────────────────
+            // ── vacate → empty (open, no bot) OR bot ────────────────────────
+            // `seat_bot=false` (Remove) leaves the seat EMPTY — the table pauses
+            // on its turn until someone sits; `seat_bot=true` (Seat a bot) drops
+            // a bot in. Any human occupant is benched to the kibitz list.
             (Some(f), None, _) => {
-                let removed = room.state.lock().await.vacate(f);
-                let Some(occ) = removed else {
-                    return Ok(vec![]); // already empty — nothing changed
+                let (removed, changed) = {
+                    let mut inner = room.state.lock().await;
+                    let was_empty = inner.no_bot.contains(&f);
+                    let removed = inner.vacate(f);
+                    if seat_bot {
+                        inner.set_bot(f);
+                    } else {
+                        inner.set_empty(f);
+                    }
+                    // A change if we removed a human OR toggled bot↔empty.
+                    let changed = removed.is_some() || was_empty != inner.no_bot.contains(&f);
+                    (removed, changed)
                 };
-                // Still seated elsewhere (multi-seat)? Then not a waiter.
-                if occ.connected && self.seats_of(&occ.sub).await.is_empty() {
-                    self.add_lobby(&occ.sub, &occ.name, Some(room.id.clone()), true)
-                        .await;
+                if let Some(occ) = removed {
+                    // Still seated elsewhere (multi-seat)? Then not a waiter.
+                    if occ.connected && self.seats_of(&occ.sub).await.is_empty() {
+                        self.add_lobby(&occ.sub, &occ.name, Some(room.id.clone()), true)
+                            .await;
+                    }
                 }
-                Ok(vec![room])
+                Ok(if changed { vec![room] } else { vec![] })
             }
             // ── move / swap ─────────────────────────────────────────────────
             (Some(f), Some(t), _) => {
@@ -1060,6 +1098,53 @@ impl Session {
                 Ok(vec![room])
             }
             _ => Err("assign_seat needs `from`, or `token`+`seat`".into()),
+        }
+    }
+
+    /// Uninvite/kick: remove a person from the table ENTIRELY (distinct from
+    /// Remove, which only benches them to the kibitz list). Vacate every seat
+    /// they hold (→ bot, so the game continues), drop them from the kibitzers
+    /// and connection registries, and signal their socket(s) to close. Returns
+    /// the rooms whose seats changed. Addressed by connection `token`.
+    pub async fn kick(&self, token: &str) -> Result<Vec<Arc<Room>>, String> {
+        let Some((sub, _name)) = self.conn_meta(token).await else {
+            return Err(format!("unknown connection token {token}"));
+        };
+        let mut changed = vec![];
+        for room in self.rooms_snapshot().await {
+            let held: Vec<Direction> = {
+                let inner = room.state.lock().await;
+                inner
+                    .seats
+                    .iter()
+                    .filter(|(_, o)| o.sub == sub)
+                    .map(|(&s, _)| s)
+                    .collect()
+            };
+            if held.is_empty() {
+                continue;
+            }
+            let mut inner = room.state.lock().await;
+            for seat in held {
+                inner.vacate(seat);
+                inner.set_bot(seat); // kicked seat continues as a bot
+            }
+            drop(inner);
+            changed.push(room);
+        }
+        // Off the table entirely: not a waiter, not a live connection.
+        self.kibitzers.lock().await.remove(&sub);
+        self.connections.lock().await.retain(|_, m| m.sub != sub);
+        // Tell the kicked socket(s) to hang up (see the KICK: handler in ws.rs).
+        let _ = self.notify.send(format!("KICK:{sub}"));
+        Ok(changed)
+    }
+
+    /// PassBot: set which sides' BOT seats always pass in the auction (empty =
+    /// none). Applies to every table in the session. Cardplay is unaffected.
+    pub async fn set_pass_sides(&self, sides: std::collections::HashSet<Side>) {
+        for room in self.rooms_snapshot().await {
+            room.state.lock().await.pass_sides = sides.clone();
         }
     }
 
@@ -1759,7 +1844,7 @@ mod tests {
 
         // Place-by-token: seat the waiter's connection at South.
         let changed = s
-            .assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"))
+            .assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"), false)
             .await
             .unwrap();
         assert_eq!(ids(&changed), vec!["s1-t1"]);
@@ -1770,17 +1855,17 @@ mod tests {
         );
 
         // Move South → North (target empty).
-        s.assign_seat(Some("s1-t1"), Some(North), Some(South), None)
+        s.assign_seat(Some("s1-t1"), Some(North), Some(South), None, false)
             .await
             .unwrap();
         assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), North)));
 
         // A second connection seated at South, then move North→South SWAPS.
         s.register_conn("tok2", "g2", "Ben").await;
-        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok2"))
+        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok2"), false)
             .await
             .unwrap();
-        s.assign_seat(Some("s1-t1"), Some(South), Some(North), None)
+        s.assign_seat(Some("s1-t1"), Some(South), Some(North), None, false)
             .await
             .unwrap();
         assert_eq!(seated_at(&s, "g1").await, Some(("s1-t1".into(), South)));
@@ -1788,11 +1873,11 @@ mod tests {
 
         // Unknown token rejected; missing from+token+target rejected.
         assert!(s
-            .assign_seat(Some("s1-t1"), Some(East), None, Some("nope"))
+            .assign_seat(Some("s1-t1"), Some(East), None, Some("nope"), false)
             .await
             .is_err());
         assert!(s
-            .assign_seat(Some("s1-t1"), None, None, None)
+            .assign_seat(Some("s1-t1"), None, None, None, false)
             .await
             .is_err());
     }
@@ -1806,7 +1891,7 @@ mod tests {
         s.register_conn("seated", "g1", "Doc").await;
         s.register_conn("ghost", "g2", "Doc").await; // stale, seatless
         s.register_conn("live", "g3", "Snow").await; // connected waiter
-        s.assign_seat(Some("s1-t1"), Some(North), None, Some("seated"))
+        s.assign_seat(Some("s1-t1"), Some(North), None, Some("seated"), false)
             .await
             .unwrap();
         // 'seated' loses its socket but keeps seat N; 'ghost' loses its socket
@@ -1850,13 +1935,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_leaves_seat_empty_seat_a_bot_toggles() {
+        use std::time::Instant;
+        let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
+        s.register_conn("tok1", "g1", "Ann").await;
+        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"), false)
+            .await
+            .unwrap();
+        // Remove (seat_bot=false) → seat is EMPTY (open, no bot): nobody drives
+        // it, so the table pauses on its turn.
+        s.assign_seat(Some("s1-t1"), None, Some(South), None, false)
+            .await
+            .unwrap();
+        {
+            let r = room_at(&s, 0).await;
+            let inner = r.state.lock().await;
+            assert!(inner.no_bot.contains(&South));
+            assert!(!inner.seat_bot_controlled(South, true, Instant::now()));
+            let seats = inner.seats_json();
+            assert_eq!(seats["S"]["kind"], "empty");
+        }
+        // Seat a bot (seat_bot=true) → seat is a bot again.
+        s.assign_seat(Some("s1-t1"), None, Some(South), None, true)
+            .await
+            .unwrap();
+        {
+            let r = room_at(&s, 0).await;
+            let inner = r.state.lock().await;
+            assert!(!inner.no_bot.contains(&South));
+            assert!(inner.seat_bot_controlled(South, true, Instant::now()));
+            assert_eq!(inner.seats_json()["S"]["kind"], "bot");
+        }
+    }
+
+    #[tokio::test]
+    async fn kick_removes_person_entirely_seat_becomes_bot() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
+        s.register_conn("tok1", "g1", "Ann").await;
+        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"), false)
+            .await
+            .unwrap();
+        let changed = s.kick("tok1").await.unwrap();
+        assert_eq!(ids(&changed), vec!["s1-t1"]);
+        // Seat freed → bot (game continues); person gone from conns + kibitzers.
+        let r = room_at(&s, 0).await;
+        let inner = r.state.lock().await;
+        assert!(inner.seats.get(&South).is_none());
+        assert!(!inner.no_bot.contains(&South));
+        assert_eq!(inner.seats_json()["S"]["kind"], "bot");
+        drop(inner);
+        assert!(s.conn_meta("tok1").await.is_none());
+        assert!(!s.kibitzers.lock().await.contains_key("g1"));
+    }
+
+    #[tokio::test]
+    async fn set_pass_sides_stores_per_room() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        let mut sides = std::collections::HashSet::new();
+        sides.insert(Side::EW);
+        s.set_pass_sides(sides).await;
+        let r = room_at(&s, 0).await;
+        let inner = r.state.lock().await;
+        assert!(inner.pass_sides.contains(&Side::EW));
+        assert!(!inner.pass_sides.contains(&Side::NS));
+        // Side::of maps seats to sides for the bidding gate.
+        assert_eq!(Side::of(East), Side::EW);
+        assert_eq!(Side::of(North), Side::NS);
+        assert_eq!(inner.pass_sides_json(), serde_json::json!(["EW"]));
+    }
+
+    #[tokio::test]
     async fn one_connection_can_hold_multiple_seats() {
         let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
         s.register_conn("tok1", "g1", "Ann").await;
-        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"))
+        s.assign_seat(Some("s1-t1"), Some(South), None, Some("tok1"), false)
             .await
             .unwrap();
-        s.assign_seat(Some("s1-t1"), Some(North), None, Some("tok1"))
+        s.assign_seat(Some("s1-t1"), Some(North), None, Some("tok1"), false)
             .await
             .unwrap();
         let mut seats = s.seats_of("g1").await;
@@ -1889,7 +2044,7 @@ mod tests {
         }
         // Vacate = from set, target None.
         let changed = s
-            .assign_seat(Some("s1-t1"), None, Some(South), None)
+            .assign_seat(Some("s1-t1"), None, Some(South), None, false)
             .await
             .unwrap();
         assert_eq!(ids(&changed), vec!["s1-t1"]);
@@ -1906,7 +2061,7 @@ mod tests {
         drop(inner);
         // Vacating an empty seat is a no-op.
         assert!(s
-            .assign_seat(Some("s1-t1"), None, Some(South), None)
+            .assign_seat(Some("s1-t1"), None, Some(South), None, false)
             .await
             .unwrap()
             .is_empty());
@@ -1998,7 +2153,7 @@ mod tests {
     async fn parked_member_is_not_auto_seated() {
         let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
         s.place("g1", "Ann").await; // South
-        s.assign_seat(Some("s1-t1"), None, Some(South), None)
+        s.assign_seat(Some("s1-t1"), None, Some(South), None, false)
             .await
             .unwrap(); // vacate → parked
         assert_eq!(

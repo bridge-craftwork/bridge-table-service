@@ -183,6 +183,8 @@ enum Pending {
         seq: usize,
         board: BoardSetup,
         calls: Vec<Call>,
+        /// PassBot: this seat's side is set to always pass — skip BBA.
+        pass: bool,
     },
     Play(Box<PlayPending>),
 }
@@ -245,6 +247,7 @@ async fn act_once(room: &Room) -> bool {
                 seq,
                 board: inner.table.board.clone(),
                 calls: f.calls.clone(),
+                pass: inner.pass_sides.contains(&crate::sessions::Side::of(seat)),
             },
             Phase::Play => {
                 let remaining = inner.table.remaining(seat, &f);
@@ -297,6 +300,7 @@ async fn act_once(room: &Room) -> bool {
             seq,
             board,
             calls,
+            pass,
         } => {
             // Bidding is ALWAYS real (BBA) in every bot mode — an all-pass
             // auction is useless for watching or practising cardplay, whatever
@@ -305,9 +309,15 @@ async fn act_once(room: &Room) -> bool {
             // all-pass, which silently passed out every served table the moment
             // a "Test players" join flipped the sticky room mode to random
             // (Rick, 2026-07-06).
-            let (call, via) = match mode {
-                BotMode::Real | BotMode::Rules | BotMode::Slow | BotMode::Random => {
-                    choose_call(room, &board, &calls).await
+            // PassBot: this side always passes (BBO-style bidding practice) —
+            // skip BBA entirely. Cardplay is unaffected (handled below).
+            let (call, via) = if pass {
+                (Call::Pass, "passbot")
+            } else {
+                match mode {
+                    BotMode::Real | BotMode::Rules | BotMode::Slow | BotMode::Random => {
+                        choose_call(room, &board, &calls).await
+                    }
                 }
             };
             (seq, Action::Call { seat, call }, via, false)
