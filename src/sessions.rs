@@ -723,6 +723,43 @@ impl Session {
         // otherwise race to create tables / grab seats, scattering the fill.
         let _seat_guard = self.seating.lock().await;
         let rooms = self.rooms_snapshot().await;
+        // 0. Friends-table resume: when the OWNER (re)opens an adhoc table, any
+        //    seat still held by a DISCONNECTED occupant is a ghost from a prior
+        //    session. Left alone it keeps blocking `first_free` — so fresh
+        //    arrivals overflow to kibitz — and, if it's the owner's own old
+        //    seat, the reconnect scan below would rebind the owner away from
+        //    South. Free every disconnected seat (→ empty → bot) and sit the
+        //    owner at South. Gated to Adhoc: classroom (TeacherSet) reconnects
+        //    are untouched, since students there legitimately drop and return
+        //    to their own seat.
+        if self.kind == SessionKind::Adhoc && sub == self.owner_sub {
+            for room in &rooms {
+                let mut inner = room.state.lock().await;
+                let ghosts: Vec<Direction> = inner
+                    .seats
+                    .iter()
+                    .filter(|(_, o)| !o.connected)
+                    .map(|(&s, _)| s)
+                    .collect();
+                for seat in ghosts {
+                    inner.vacate(seat);
+                }
+            }
+            let room = self.watch_table(&rooms).await;
+            if room
+                .state
+                .lock()
+                .await
+                .try_seat(Direction::South, sub, name)
+            {
+                return Placement {
+                    room,
+                    seat: Some(Direction::South),
+                };
+            }
+            // South is held by a live player — fall through to normal placement
+            // (don't evict a connected human to seat the owner).
+        }
         // 1. Reconnect: an existing seat always wins.
         for room in &rooms {
             let mut inner = room.state.lock().await;
@@ -1427,6 +1464,56 @@ mod tests {
         assert_eq!((tidx(&p1), p1.seat), (0, Some(South)));
         assert_eq!((tidx(&p2), p2.seat), (1, Some(South)));
         assert_eq!((tidx(&p3), p3.seat), (0, Some(West)));
+    }
+
+    #[tokio::test]
+    async fn adhoc_owner_resume_frees_ghosts_and_takes_south() {
+        // Prior session left three DISCONNECTED occupants holding S/W/N (the
+        // owner's own stale seat among them). On the owner reopening the table,
+        // all ghosts free (→ bot) and the owner lands at South.
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        {
+            let r = room_at(&s, 0).await;
+            let mut inner = r.state.lock().await;
+            assert!(inner.try_seat(South, "owner-1", "Host")); // owner's old seat
+            assert!(inner.try_seat(West, "g2", "Ben"));
+            assert!(inner.try_seat(North, "g3", "Cyd"));
+            inner.mark_disconnected("owner-1");
+            inner.mark_disconnected("g2");
+            inner.mark_disconnected("g3");
+        }
+        let p = s.place("owner-1", "Host").await;
+        assert_eq!((tidx(&p), p.seat), (0, Some(South)));
+        let r = room_at(&s, 0).await;
+        let inner = r.state.lock().await;
+        // Only the owner remains seated; the ghosts are gone (bot-driven).
+        assert_eq!(inner.seats.len(), 1);
+        assert!(inner.seats.get(&South).is_some_and(|o| o.sub == "owner-1"));
+        // A fresh arrival now seats (previously blocked by ghosts).
+        drop(inner);
+        let a = s.place("g9", "New").await;
+        assert_eq!((tidx(&a), a.seat), (0, Some(West)));
+    }
+
+    #[tokio::test]
+    async fn teacher_set_reconnect_keeps_own_seat_not_forced_south() {
+        // The Adhoc owner-resume sweep must NOT touch classroom sessions: a
+        // student who disconnected from North reconnects to North, not South,
+        // and other disconnected students keep their seats.
+        let s = session(SessionKind::TeacherSet, SeatPolicy::Manual, 1);
+        {
+            let r = room_at(&s, 0).await;
+            let mut inner = r.state.lock().await;
+            assert!(inner.try_seat(North, "owner-1", "Teach"));
+            assert!(inner.try_seat(East, "g2", "Ben"));
+            inner.mark_disconnected("owner-1");
+            inner.mark_disconnected("g2");
+        }
+        let p = s.place("owner-1", "Teach").await;
+        assert_eq!((tidx(&p), p.seat), (0, Some(North)));
+        let r = room_at(&s, 0).await;
+        let inner = r.state.lock().await;
+        assert!(inner.seats.get(&East).is_some_and(|o| o.sub == "g2"));
     }
 
     #[tokio::test]
