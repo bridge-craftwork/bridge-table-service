@@ -340,9 +340,23 @@ impl Session {
             .cloned()
             .unwrap_or_else(crate::rooms::placeholder_board);
         let (notify, _) = broadcast::channel(64);
+        // Friends (adhoc) tables hand off to bots fast; classroom sets keep the
+        // generous reconnect grace (see TakeoverGrace).
+        let grace = if matches!(kind, SessionKind::Adhoc) {
+            crate::rooms::TakeoverGrace::FAST
+        } else {
+            crate::rooms::TakeoverGrace::DEFAULT
+        };
         Arc::new_cyclic(|weak: &Weak<Session>| {
             let rooms: Vec<Arc<Room>> = (1..=table_count)
-                .map(|i| Room::new(format!("{id}-t{i}"), seed.clone(), Some(weak.clone())))
+                .map(|i| {
+                    Room::new(
+                        format!("{id}-t{i}"),
+                        seed.clone(),
+                        Some(weak.clone()),
+                        grace,
+                    )
+                })
                 .collect();
             Session {
                 id,
@@ -409,10 +423,16 @@ impl Session {
                 d.boards[d.index].clone()
             }
         };
+        let grace = if matches!(self.kind, SessionKind::Adhoc) {
+            crate::rooms::TakeoverGrace::FAST
+        } else {
+            crate::rooms::TakeoverGrace::DEFAULT
+        };
         let room = Room::new(
             format!("{}-t{}", self.id, n),
             board,
             Some(self.weak_self.clone()),
+            grace,
         );
         // New tables inherit the session's bot backend + pause state.
         room.set_bot_mode(self.bot_mode());
@@ -579,10 +599,19 @@ impl Session {
         let conns = self.connections.lock().await;
         let mut entries: Vec<(String, String, Value)> = conns
             .iter()
-            .map(|(token, m)| {
+            .filter_map(|(token, m)| {
                 let mut seats = seats_by_sub.get(&m.sub).cloned().unwrap_or_default();
+                // A disconnected connection that holds NO seat has genuinely
+                // left (a departed waiter/kibitzer, or the stale old session of
+                // someone who rejoined under a fresh guest sub). Drop it so it
+                // doesn't linger as a duplicate ghost in the kibitz list. A
+                // disconnected connection that still HOLDS a seat is a live
+                // zombie seat and stays (greyed) so the host can see it.
+                if !m.connected && seats.is_empty() {
+                    return None;
+                }
                 seats.sort();
-                (
+                Some((
                     m.name.clone(),
                     token.clone(),
                     json!({
@@ -591,7 +620,7 @@ impl Session {
                         "connected": m.connected,
                         "seats": seats,
                     }),
-                )
+                ))
             })
             .collect();
         // Stable order for the host UI (name, then token as tiebreak).
@@ -1766,6 +1795,58 @@ mod tests {
             .assign_seat(Some("s1-t1"), None, None, None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn roster_drops_disconnected_seatless_connections() {
+        // A disconnected connection that still holds a seat stays (greyed
+        // zombie seat); a disconnected connection with no seat is dropped so a
+        // same-name rejoin doesn't pile up duplicate ghost kibitzers.
+        let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
+        s.register_conn("seated", "g1", "Doc").await;
+        s.register_conn("ghost", "g2", "Doc").await; // stale, seatless
+        s.register_conn("live", "g3", "Snow").await; // connected waiter
+        s.assign_seat(Some("s1-t1"), Some(North), None, Some("seated"))
+            .await
+            .unwrap();
+        // 'seated' loses its socket but keeps seat N; 'ghost' loses its socket
+        // with no seat.
+        s.mark_conn_disconnected("seated").await;
+        s.mark_conn_disconnected("ghost").await;
+
+        let roster = s.roster_json().await;
+        let tokens: Vec<&str> = roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["token"].as_str().unwrap())
+            .collect();
+        assert!(tokens.contains(&"seated"), "seated ghost stays (holds N)");
+        assert!(tokens.contains(&"live"), "connected waiter stays");
+        assert!(
+            !tokens.contains(&"ghost"),
+            "disconnected seatless conn is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn adhoc_uses_fast_takeover_grace_teacher_set_default() {
+        use crate::rooms::TakeoverGrace;
+        let adhoc = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        let g = room_at(&adhoc, 0).await.state.lock().await.takeover;
+        assert_eq!(g.on_turn, TakeoverGrace::FAST.on_turn);
+        assert_eq!(g.off_turn, TakeoverGrace::FAST.off_turn);
+        // add_room path inherits it too.
+        let r2 = adhoc.add_room().await;
+        assert_eq!(
+            r2.state.lock().await.takeover.on_turn,
+            TakeoverGrace::FAST.on_turn
+        );
+
+        let cls = session(SessionKind::TeacherSet, SeatPolicy::Manual, 1);
+        let gc = room_at(&cls, 0).await.state.lock().await.takeover;
+        assert_eq!(gc.on_turn, TakeoverGrace::DEFAULT.on_turn);
+        assert_eq!(gc.off_turn, TakeoverGrace::DEFAULT.off_turn);
     }
 
     #[tokio::test]

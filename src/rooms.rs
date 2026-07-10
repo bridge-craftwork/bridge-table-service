@@ -29,6 +29,38 @@ pub const TAKEOVER_AFTER: Duration = Duration::from_secs(60);
 /// seat's turn.
 pub const TAKEOVER_AFTER_ON_TURN: Duration = Duration::from_secs(20);
 
+/// Per-room bot-takeover grace. Classroom (`TeacherSet`) sessions keep the
+/// generous `DEFAULT` window — students refresh a lot and a lockstep set is
+/// teacher-paced. Adhoc friends tables use `FAST`: a closed tab becomes a bot
+/// almost immediately, since the host wants play to continue rather than wait
+/// out a reconnect that usually isn't coming (Rick, 2026-07-10).
+#[derive(Clone, Copy)]
+pub struct TakeoverGrace {
+    /// Grace while the table is on the disconnected seat's turn (blocking).
+    pub on_turn: Duration,
+    /// Grace while the seat is not on turn.
+    pub off_turn: Duration,
+}
+
+impl TakeoverGrace {
+    pub const DEFAULT: Self = Self {
+        on_turn: TAKEOVER_AFTER_ON_TURN,
+        off_turn: TAKEOVER_AFTER,
+    };
+    /// Friends-table grace: ~3s — long enough to ride out a quick reconnect,
+    /// short enough to kill the jarring 20–30s stall.
+    pub const FAST: Self = Self {
+        on_turn: Duration::from_secs(3),
+        off_turn: Duration::from_secs(3),
+    };
+}
+
+impl Default for TakeoverGrace {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Internal broadcast marker telling every connection to send its own
 /// per-viewer redacted snapshot (a broadcast can't carry a snapshot because
 /// snapshots are per-viewer). Never forwarded to clients. Used after undo
@@ -174,10 +206,18 @@ pub struct RoomInner {
     pub ready: HashSet<Direction>,
     /// How boards run at this table (see `BoardMode`).
     pub board_mode: BoardMode,
+    /// Bot-takeover grace for this room's seats (see `TakeoverGrace`); set
+    /// from the owning session's kind.
+    pub takeover: TakeoverGrace,
 }
 
 impl Room {
-    pub fn new(id: String, board: BoardSetup, session: Option<Weak<Session>>) -> Arc<Self> {
+    pub fn new(
+        id: String,
+        board: BoardSetup,
+        session: Option<Weak<Session>>,
+        takeover: TakeoverGrace,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
         Arc::new(Self {
             id,
@@ -187,6 +227,7 @@ impl Room {
                 board_index: 0,
                 ready: HashSet::new(),
                 board_mode: BoardMode::default(),
+                takeover,
             }),
             events,
             bot_running: std::sync::atomic::AtomicBool::new(false),
@@ -236,7 +277,7 @@ impl Room {
     /// A room on the demo board, for unit tests in other modules.
     #[cfg(test)]
     pub fn new_for_test(id: &str) -> Arc<Self> {
-        Self::new(id.to_string(), demo_board(), None)
+        Self::new(id.to_string(), demo_board(), None, TakeoverGrace::DEFAULT)
     }
 }
 
@@ -394,9 +435,9 @@ impl RoomInner {
             return false;
         }
         let grace = if on_turn {
-            TAKEOVER_AFTER_ON_TURN
+            self.takeover.on_turn
         } else {
-            TAKEOVER_AFTER
+            self.takeover.off_turn
         };
         occ.disconnected_at
             .is_some_and(|t| now.duration_since(t) >= grace)
@@ -467,7 +508,7 @@ impl Registry {
             return r.clone();
         }
         let board = demo_board();
-        let room = Room::new("demo".to_string(), board, None);
+        let room = Room::new("demo".to_string(), board, None, TakeoverGrace::DEFAULT);
         rooms.insert("demo".to_string(), room.clone());
         room
     }
@@ -646,6 +687,7 @@ mod tests {
             board_index: 0,
             ready: HashSet::new(),
             board_mode: BoardMode::default(),
+            takeover: TakeoverGrace::DEFAULT,
         };
         assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
         assert_eq!(inner.seat_or_rebind("u2", "Bob"), Some(Direction::West));
@@ -664,6 +706,7 @@ mod tests {
             board_index: 0,
             ready: HashSet::new(),
             board_mode: BoardMode::default(),
+            takeover: TakeoverGrace::DEFAULT,
         };
         for sub in subs {
             inner.seat_or_rebind(sub, sub);
