@@ -410,6 +410,7 @@ fn welcome_msg(
         // Shared roster (also on every snapshot + roster_update).
         "roster": roster,
         "bot_mode": bot_mode,
+        "bots_paused": session.bots_paused(),
         // Deal-set status so the client renders the board or a "waiting for
         // the teacher to load a deal" overlay (roadmap §Phase 3.1).
         "loaded": total > &0,
@@ -797,9 +798,14 @@ async fn handle_teacher_msg(
             None
         }
         Some("pause_bots") => {
-            session
-                .set_bots_paused(v["on"].as_bool().unwrap_or(true))
-                .await;
+            let on = v["on"].as_bool().unwrap_or(true);
+            session.set_bots_paused(on).await;
+            // Tell every connection (seated players included) so the host's
+            // toggle reflects the state and undo switches to step-back mode.
+            let frame = json!({ "t": "event", "kind": "bots_paused", "on": on }).to_string();
+            for room in session.rooms_snapshot().await {
+                room.broadcast(frame.clone());
+            }
             None
         }
         // Seat/token-addressed host seat control (friends-table model):
@@ -1272,14 +1278,26 @@ async fn handle_client_msg(
             //     human at the table may trigger it (table-wide, not
             //     sender-scoped).
             let mut inner = room.state.lock().await;
+            let bots_paused = session.is_some_and(|s| s.bots_paused());
             let to_seq = match v["to_seq"].as_u64() {
                 Some(n) => n as usize,
+                // Bots PAUSED: step back ONE action (any actor) so the host /
+                // teacher can undo a bot's call or play and override it.
+                None if bots_paused => {
+                    let seq = inner.table.seq();
+                    if seq == 0 {
+                        return Some(err_msg("nothing_to_undo", "nothing to undo"));
+                    }
+                    seq - 1
+                }
+                // Bots running: rewind to the last human action (a lone bot
+                // undo would just be replayed instantly).
                 None => match inner.last_human_action_seq(std::time::Instant::now()) {
                     Some(seq) => seq,
                     None => {
                         return Some(err_msg(
                             "no_human_action",
-                            "no human has acted on this board yet",
+                            "no human has acted — pause bots to step back",
                         ))
                     }
                 },
