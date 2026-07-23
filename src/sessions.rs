@@ -272,6 +272,28 @@ pub struct ConnMeta {
     pub connected: bool,
 }
 
+/// The bridge-classroom account id behind a ticket subject, or `None` for a
+/// guest.
+///
+/// Guest subjects are minted as `guest-<uuid>` by the classroom API's
+/// ticket endpoint; every other subject IS the account's `users.id`.
+///
+/// **Why this is exposed in the roster.** Friend requests must be addressed by
+/// account id, and the friendship ADR deliberately provides no user-search: the
+/// *only* way to befriend someone is to have shared a table with them. So the
+/// roster is the one place that handle can legitimately come from. What travels
+/// is an opaque UUID — not a name or email beyond what the roster already
+/// shows — and it grants exactly one capability: "ask this person to be
+/// friends", which is the intended bootstrap. Guests get `null`, matching the
+/// rule that a guest cannot be friended.
+pub fn account_id_of(sub: &str) -> Option<&str> {
+    if sub.starts_with("guest-") {
+        None
+    } else {
+        Some(sub)
+    }
+}
+
 /// The session's loaded board set. `index` is the lockstep teacher pointer
 /// (0-based current board, forced onto every table by `deal_index_to_all`).
 /// An empty `boards` = idle: no deal loaded yet, rooms hold a throwaway
@@ -605,6 +627,9 @@ impl Session {
     /// that rides in every welcome/snapshot plus the `roster_update` event.
     /// Locks rooms sequentially then the connections leaf — never call while
     /// holding a room lock.
+    ///
+    /// Entries carry `account_id` (null for guests) so the client can offer
+    /// "Add friend" — see [`account_id_of`].
     pub async fn roster_json(&self) -> Value {
         let rooms = self.rooms_snapshot().await;
         let mut seats_by_sub: HashMap<String, Vec<String>> = HashMap::new();
@@ -642,6 +667,7 @@ impl Session {
                         "name": m.name,
                         "connected": m.connected,
                         "seats": seats,
+                        "account_id": account_id_of(&m.sub),
                     }),
                 ))
             })
@@ -2243,6 +2269,43 @@ mod tests {
         assert_eq!(s.table_count().await, 1, "no duplicate table");
         assert_eq!(seated_at(&s, "g2-new").await, Some(("s1-t1".into(), South)));
         assert_eq!(seated_at(&s, "g1").await, None, "old sub replaced");
+    }
+
+    #[test]
+    fn account_id_is_none_for_guests_and_the_sub_otherwise() {
+        // Guests cannot be friended, so they must not surface an account id.
+        assert_eq!(
+            account_id_of("guest-2f1c9e10-0000-4000-8000-000000000001"),
+            None
+        );
+        // A registered subject IS the classroom users.id.
+        assert_eq!(
+            account_id_of("2f1c9e10-0000-4000-8000-000000000002"),
+            Some("2f1c9e10-0000-4000-8000-000000000002")
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_exposes_account_id_for_members_and_null_for_guests() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        s.register_conn("tok-member", "u-member", "Ann Alpha").await;
+        s.register_conn("tok-guest", "guest-abc", "Bob S.").await;
+
+        let roster = s.roster_json().await;
+        let entries = roster.as_array().expect("roster is an array");
+        let find = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from roster"))
+                .clone()
+        };
+
+        assert_eq!(find("Ann Alpha")["account_id"], "u-member");
+        assert!(
+            find("Bob S.")["account_id"].is_null(),
+            "a guest must not expose an account id"
+        );
     }
 
     #[tokio::test]
