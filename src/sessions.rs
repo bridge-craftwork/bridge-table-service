@@ -1980,7 +1980,7 @@ mod tests {
         // Seat freed → bot (game continues); person gone from conns + kibitzers.
         let r = room_at(&s, 0).await;
         let inner = r.state.lock().await;
-        assert!(inner.seats.get(&South).is_none());
+        assert!(!inner.seats.contains_key(&South));
         assert!(!inner.no_bot.contains(&South));
         assert_eq!(inner.seats_json()["S"]["kind"], "bot");
         drop(inner);
