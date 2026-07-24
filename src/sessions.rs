@@ -223,6 +223,7 @@ pub fn parse_boards(pbn: &str) -> Result<Vec<BoardSetup>, String> {
             dealer,
             vulnerable: b.vulnerable,
             deal: b.deal.clone(),
+            play_line: crate::table::PlayLine::from_sequence(b.play.as_ref()),
         });
     }
     if out.is_empty() {

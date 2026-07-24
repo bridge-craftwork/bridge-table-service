@@ -169,6 +169,7 @@ mod tests {
                 "N:K843.T542.J6.863 AQJ7.K.Q75.AT942 962.AJ7.KT82.J75 T5.Q9863.A943.KQ",
             )
             .unwrap(),
+            play_line: None,
         }
     }
 
