@@ -178,6 +178,22 @@ pub struct Occupant {
     pub disconnected_at: Option<Instant>,
 }
 
+/// A seat held for an invited friend (friendship Phase 4) until they redeem it
+/// — a joining ticket whose `sub` matches seats directly (see
+/// `Session::place_seat`) — or `expires_at` passes. Created by the Mac API over
+/// the admin channel *after* it has verified the friendship; the table service
+/// itself has no friend graph, so it only holds the seat. A reserved seat is
+/// absent from `seats` (a bot fills it until the friend arrives), so it never
+/// blocks play; it just renders as `reserved` and can't be auto-seated by
+/// someone else.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    /// The invitee's future ticket subject (their account/user id).
+    pub sub: String,
+    pub name: String,
+    pub expires_at: Instant,
+}
+
 pub struct Room {
     pub id: String,
     pub state: Mutex<RoomInner>,
@@ -222,6 +238,12 @@ pub struct RoomInner {
     /// its turn until a human sits or the host seats a bot. Cleared when a seat
     /// is occupied. This is the third seat state beyond human / bot.
     pub no_bot: HashSet<Direction>,
+    /// Seats held for an invited friend (friendship Phase 4), keyed by
+    /// direction. A reserved seat renders as `reserved` and is redeemed when a
+    /// ticket with the matching `sub` joins; a bot fills it meanwhile. Never
+    /// coexists with an occupant in `seats` (reserving requires the seat vacant;
+    /// seating clears the reservation).
+    pub reservations: HashMap<Direction, Reservation>,
     /// Sides whose BOT seats always pass in the auction (PassBot) instead of
     /// bidding via BBA. Cardplay is unaffected (still the room's cardplay bot).
     /// For BBO-style bidding practice where you don't want the opponents
@@ -247,6 +269,7 @@ impl Room {
                 board_mode: BoardMode::default(),
                 takeover,
                 no_bot: HashSet::new(),
+                reservations: HashMap::new(),
                 pass_sides: HashSet::new(),
             }),
             events,
@@ -369,6 +392,69 @@ impl RoomInner {
         self.no_bot.remove(&seat);
     }
 
+    // ── Seat reservations (friendship Phase 4) ──────────────────────────────
+
+    /// The live (unexpired) reservation for a seat, if any. Lazy expiry: an
+    /// entry past `expires_at` reads as absent so displays/redemption are correct
+    /// even before the sweep removes it.
+    pub fn active_reservation(&self, seat: Direction, now: Instant) -> Option<&Reservation> {
+        self.reservations.get(&seat).filter(|r| r.expires_at > now)
+    }
+
+    /// Hold a vacant seat for `sub` until `expires_at`. Fails if a human already
+    /// occupies it; replaces any prior reservation for the same seat (re-invite).
+    /// Clears the `no_bot` flag so the seat isn't ALSO an explicit-empty.
+    pub fn try_reserve(
+        &mut self,
+        seat: Direction,
+        sub: &str,
+        name: &str,
+        expires_at: Instant,
+    ) -> bool {
+        if self.seats.contains_key(&seat) {
+            return false;
+        }
+        self.no_bot.remove(&seat);
+        self.reservations.insert(
+            seat,
+            Reservation {
+                sub: sub.to_string(),
+                name: name.to_string(),
+                expires_at,
+            },
+        );
+        true
+    }
+
+    /// Release a reservation (decline / host cancel / redeemed). Returns whether
+    /// one was present.
+    pub fn cancel_reservation(&mut self, seat: Direction) -> bool {
+        self.reservations.remove(&seat).is_some()
+    }
+
+    /// Drop expired reservations; returns the seats that changed (for a
+    /// re-broadcast). Called by the keepalive sweep.
+    pub fn sweep_reservations(&mut self, now: Instant) -> Vec<Direction> {
+        let expired: Vec<Direction> = self
+            .reservations
+            .iter()
+            .filter(|(_, r)| r.expires_at <= now)
+            .map(|(&s, _)| s)
+            .collect();
+        for seat in &expired {
+            self.reservations.remove(seat);
+        }
+        expired
+    }
+
+    /// The seat reserved for `sub` (unexpired), if any — the redemption lookup.
+    pub fn reserved_seat_for(&self, sub: &str, now: Instant) -> Option<Direction> {
+        self.reservations
+            .iter()
+            .find(|(_, r)| r.sub == sub && r.expires_at > now)
+            .map(|(&s, _)| s)
+    }
+
     /// Vacate a seat (teacher boot / assign away). Returns the removed
     /// occupant. Also clears the seat's ready flag.
     pub fn vacate(&mut self, seat: Direction) -> Option<Occupant> {
@@ -481,6 +567,7 @@ impl RoomInner {
     }
 
     pub fn seats_json(&self) -> serde_json::Value {
+        let now = Instant::now();
         let mut m = serde_json::Map::new();
         for seat in Direction::ALL {
             let v = match self.seats.get(&seat) {
@@ -489,10 +576,15 @@ impl RoomInner {
                     "name": o.name,
                     "connected": o.connected,
                 }),
-                // Absent: a bot by default, or "empty" (open, no bot) if the
-                // host removed the occupant without seating a bot.
-                None if self.no_bot.contains(&seat) => serde_json::json!({ "kind": "empty" }),
-                None => serde_json::json!({ "kind": "bot" }),
+                // Held for an invited friend until they redeem it (a bot fills it
+                // meanwhile). Checked before the bot/empty fallthrough.
+                None => match self.active_reservation(seat, now) {
+                    Some(r) => serde_json::json!({ "kind": "reserved", "name": r.name }),
+                    // Absent: a bot by default, or "empty" (open, no bot) if the
+                    // host removed the occupant without seating a bot.
+                    None if self.no_bot.contains(&seat) => serde_json::json!({ "kind": "empty" }),
+                    None => serde_json::json!({ "kind": "bot" }),
+                },
             };
             m.insert(seat.to_char().to_string(), v);
         }
@@ -747,6 +839,7 @@ mod tests {
             board_mode: BoardMode::default(),
             takeover: TakeoverGrace::DEFAULT,
             no_bot: HashSet::new(),
+            reservations: HashMap::new(),
             pass_sides: HashSet::new(),
         };
         assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
@@ -759,6 +852,52 @@ mod tests {
         assert_eq!(inner.seat_or_rebind("u5", "Eve"), None);
     }
 
+    #[test]
+    fn reservation_holds_a_vacant_seat_and_renders_reserved() {
+        let mut inner = inner_with(&[]);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(120);
+        assert!(inner.try_reserve(Direction::North, "u-friend", "Alice", future));
+        let seats = inner.seats_json();
+        assert_eq!(seats["N"]["kind"], "reserved");
+        assert_eq!(seats["N"]["name"], "Alice");
+        // Redemption lookup finds the seat by sub, and only that sub.
+        assert_eq!(
+            inner.reserved_seat_for("u-friend", now),
+            Some(Direction::North)
+        );
+        assert_eq!(inner.reserved_seat_for("someone-else", now), None);
+    }
+
+    #[test]
+    fn cannot_reserve_an_occupied_seat() {
+        let mut inner = inner_with(&["u1"]); // seats u1 at South
+        let future = Instant::now() + Duration::from_secs(120);
+        assert!(!inner.try_reserve(Direction::South, "u-friend", "Alice", future));
+    }
+
+    #[test]
+    fn expired_reservation_reads_as_absent_then_sweeps() {
+        let mut inner = inner_with(&[]);
+        let past = Instant::now() - Duration::from_secs(1);
+        inner.reservations.insert(
+            Direction::East,
+            Reservation {
+                sub: "u".into(),
+                name: "A".into(),
+                expires_at: past,
+            },
+        );
+        let now = Instant::now();
+        // Lazy expiry: reads as absent → the seat shows as a bot, redemption misses.
+        assert!(inner.active_reservation(Direction::East, now).is_none());
+        assert_eq!(inner.seats_json()["E"]["kind"], "bot");
+        assert_eq!(inner.reserved_seat_for("u", now), None);
+        // The sweep then actually removes it.
+        assert_eq!(inner.sweep_reservations(now), vec![Direction::East]);
+        assert!(inner.reservations.is_empty());
+    }
+
     fn inner_with(subs: &[&str]) -> RoomInner {
         let mut inner = RoomInner {
             table: TableState::new(demo_board()),
@@ -768,6 +907,7 @@ mod tests {
             board_mode: BoardMode::default(),
             takeover: TakeoverGrace::DEFAULT,
             no_bot: HashSet::new(),
+            reservations: HashMap::new(),
             pass_sides: HashSet::new(),
         };
         for sub in subs {

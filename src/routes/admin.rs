@@ -23,6 +23,8 @@
 //! `DELETE /admin/sessions/:id` unregisters the session and tells every
 //! connection at its tables (`session_closed` event) to hang up.
 
+use std::time::Duration;
+
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -30,6 +32,7 @@ use axum::{
     routing::{delete, post},
     Json, Router,
 };
+use bridge_types::Direction;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -40,6 +43,113 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/admin/sessions", post(create_session))
         .route("/admin/sessions/:id", delete(delete_session))
+        // Seat reservations (friendship Phase 4 invitations). The Mac API calls
+        // these AFTER verifying the friendship; the table service only holds the
+        // seat (it has no friend graph).
+        .route(
+            "/admin/sessions/:id/reservations",
+            post(reserve_seat).delete(cancel_reservation),
+        )
+}
+
+/// Default reservation lifetime (ADR-0006 §4: 2–3 min). Clamped range below.
+const DEFAULT_RESERVATION_TTL_SECS: u64 = 150;
+const MIN_RESERVATION_TTL_SECS: u64 = 30;
+const MAX_RESERVATION_TTL_SECS: u64 = 600;
+
+#[derive(Deserialize)]
+struct ReservationRequest {
+    /// Seat to hold: "N" | "E" | "S" | "W".
+    seat: String,
+    /// The invitee's future ticket `sub` (their account id) — the redemption key.
+    sub: String,
+    /// Display name shown in the pending seat.
+    name: String,
+    /// Optional TTL override (seconds); clamped to [30, 600].
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct CancelReservationRequest {
+    seat: String,
+}
+
+fn parse_seat(s: &str) -> Option<Direction> {
+    s.chars().next().and_then(Direction::from_char)
+}
+
+/// Broadcast the seat change to everyone at the room and refresh the teacher
+/// lobby — mirrors what the WS `assign_seat`/`boot` handlers do after a change.
+async fn broadcast_seat_change(room: &crate::rooms::Room, session: &Session) {
+    let ev = {
+        let inner = room.state.lock().await;
+        crate::routes::ws::seats_event(room, &inner)
+    };
+    room.broadcast(ev);
+    session.notify_lobby();
+}
+
+async fn reserve_seat(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ReservationRequest>,
+) -> Response {
+    if !authorized(&headers, &state) {
+        return err(StatusCode::UNAUTHORIZED, "bad service secret");
+    }
+    let Some(seat) = parse_seat(&req.seat) else {
+        return err(StatusCode::BAD_REQUEST, "bad seat");
+    };
+    if req.sub.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "sub is required");
+    }
+    let Some(session) = state.rooms.get_session(&id).await else {
+        return err(StatusCode::NOT_FOUND, "no such session");
+    };
+    let ttl = Duration::from_secs(
+        req.ttl_secs
+            .unwrap_or(DEFAULT_RESERVATION_TTL_SECS)
+            .clamp(MIN_RESERVATION_TTL_SECS, MAX_RESERVATION_TTL_SECS),
+    );
+    match session.reserve_seat(seat, &req.sub, &req.name, ttl).await {
+        Ok(room) => {
+            broadcast_seat_change(&room, &session).await;
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "table_id": room.id, "expires_in_secs": ttl.as_secs() })),
+            )
+                .into_response()
+        }
+        Err(e) => err(StatusCode::CONFLICT, e),
+    }
+}
+
+async fn cancel_reservation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<CancelReservationRequest>,
+) -> Response {
+    if !authorized(&headers, &state) {
+        return err(StatusCode::UNAUTHORIZED, "bad service secret");
+    }
+    let Some(seat) = parse_seat(&req.seat) else {
+        return err(StatusCode::BAD_REQUEST, "bad seat");
+    };
+    let Some(session) = state.rooms.get_session(&id).await else {
+        return err(StatusCode::NOT_FOUND, "no such session");
+    };
+    let (room, removed) = session.cancel_reservation(seat).await;
+    if removed {
+        broadcast_seat_change(&room, &session).await;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "removed": removed })),
+    )
+        .into_response()
 }
 
 fn authorized(headers: &HeaderMap, state: &SharedState) -> bool {
