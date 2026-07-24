@@ -156,6 +156,14 @@ impl BoardMode {
             BoardMode::PlayOnly => "play-only",
         }
     }
+
+    pub fn from_u8(v: u8) -> BoardMode {
+        match v {
+            1 => BoardMode::BidOnly,
+            2 => BoardMode::PlayOnly,
+            _ => BoardMode::BidAndPlay,
+        }
+    }
 }
 
 /// A seated (or recently seated) occupant.

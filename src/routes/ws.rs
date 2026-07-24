@@ -712,7 +712,11 @@ async fn handle_teacher_msg(
                 Err(e) => return Some(err_msg("bad_pbn", &e)),
             };
             let label = v["label"].as_str().map(|s| s.to_string());
-            match session.load_boards(boards, label).await {
+            // Optional board mode (the client's "play the hand after bidding"
+            // choice, carried through the solo→served upgrade). Absent → keep
+            // the session's current mode.
+            let mode = v["mode"].as_str().and_then(crate::rooms::BoardMode::parse);
+            match session.load_boards(boards, label, mode).await {
                 Ok(_) => None,
                 Err(e) => Some(err_msg("rejected", &e)),
             }
