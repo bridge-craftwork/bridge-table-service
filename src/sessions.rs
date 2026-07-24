@@ -322,6 +322,12 @@ pub struct Session {
     /// Session-default bot backend (`BotMode as u8`); new tables inherit it,
     /// `set_bot_mode` applies it to all. Surfaced on the console.
     bot_mode: std::sync::atomic::AtomicU8,
+    /// Session-default board mode (`BoardMode as u8`); new tables inherit it,
+    /// `set_board_mode` applies it to all. Carried in from the client (the solo
+    /// "play the hand after bidding" preference, via `load_boards`'s optional
+    /// `mode`), so an in-place solo→served upgrade keeps bidding-only vs
+    /// bid-and-play instead of always defaulting to play.
+    board_mode: std::sync::atomic::AtomicU8,
     /// Teacher pause: bots stop acting until resumed (Shark "Stop play").
     bots_paused: std::sync::atomic::AtomicBool,
     /// The loaded set + label + lockstep pointer. Swappable at runtime
@@ -411,6 +417,9 @@ impl Session {
                 seat_policy: std::sync::Mutex::new(seat_policy),
                 seating: Mutex::new(()),
                 bot_mode: std::sync::atomic::AtomicU8::new(crate::rooms::BotMode::default() as u8),
+                board_mode: std::sync::atomic::AtomicU8::new(
+                    crate::rooms::BoardMode::default() as u8
+                ),
                 bots_paused: std::sync::atomic::AtomicBool::new(false),
                 deck: Mutex::new(Deck {
                     boards: Arc::new(boards),
@@ -480,8 +489,9 @@ impl Session {
             Some(self.weak_self.clone()),
             grace,
         );
-        // New tables inherit the session's bot backend + pause state.
+        // New tables inherit the session's bot backend + board mode.
         room.set_bot_mode(self.bot_mode());
+        room.state.lock().await.board_mode = self.board_mode();
         self.rooms.write().await.push(room.clone());
         crate::bots::ensure_keepalive(room.clone());
         if !self.bots_paused() {
@@ -522,6 +532,23 @@ impl Session {
         self.bot_mode.store(mode as u8, Ordering::SeqCst);
         for room in self.rooms_snapshot().await {
             room.set_bot_mode(mode);
+            if !self.bots_paused() {
+                crate::bots::kick(room);
+            }
+        }
+        self.notify_lobby();
+    }
+    pub fn board_mode(&self) -> crate::rooms::BoardMode {
+        crate::rooms::BoardMode::from_u8(self.board_mode.load(Ordering::SeqCst))
+    }
+    /// Change how boards run (bid-and-play / bid-only / play-only) for every
+    /// table — and future ones. Applied under each room's lock (board mode is
+    /// RoomInner state), then bots are re-kicked so a switch to play-only /
+    /// back to bid-and-play resumes bot action immediately.
+    pub async fn set_board_mode(&self, mode: crate::rooms::BoardMode) {
+        self.board_mode.store(mode as u8, Ordering::SeqCst);
+        for room in self.rooms_snapshot().await {
+            room.state.lock().await.board_mode = mode;
             if !self.bots_paused() {
                 crate::bots::kick(room);
             }
@@ -1269,6 +1296,7 @@ impl Session {
         &self,
         boards: Vec<BoardSetup>,
         label: Option<String>,
+        mode: Option<crate::rooms::BoardMode>,
     ) -> Result<usize, String> {
         if boards.is_empty() {
             return Err("no boards to load".into());
@@ -1279,6 +1307,12 @@ impl Session {
             d.boards = Arc::new(boards);
             d.label = label.clone();
             d.index = 0;
+        }
+        // Optional board mode carried in with the set (the client's "play the
+        // hand after bidding" choice). Absent → leave the current mode as-is, so
+        // reloading a set never silently flips a mode the teacher already chose.
+        if let Some(mode) = mode {
+            self.set_board_mode(mode).await;
         }
         // Adhoc opens the whole set; teacher_set ignores this (lockstep).
         self.open_boards.store(total, Ordering::SeqCst);
@@ -1448,6 +1482,7 @@ impl Session {
             "wait_to_seat": self.wait_to_seat.load(Ordering::SeqCst),
             "seat_policy": self.seat_policy().key(),
             "bot_mode": self.bot_mode().as_str(),
+            "board_mode": self.board_mode().as_str(),
             "bots_paused": self.bots_paused(),
             "boards": {
                 "total": total,
@@ -1713,7 +1748,8 @@ mod tests {
         assert_eq!(
             s.load_boards(
                 parse_boards(TWO_BOARDS).unwrap(),
-                Some("Scenarios - Transfers".into())
+                Some("Scenarios - Transfers".into()),
+                None
             )
             .await
             .unwrap(),
@@ -1730,13 +1766,13 @@ mod tests {
         // Move forward, then load a fresh set → pointer resets to board 1.
         s.next_board().await;
         assert_eq!(s.deck_status().await.1, 2);
-        s.load_boards(parse_boards(TWO_BOARDS).unwrap(), Some("Mix".into()))
+        s.load_boards(parse_boards(TWO_BOARDS).unwrap(), Some("Mix".into()), None)
             .await
             .unwrap();
         assert_eq!(s.deck_status().await.1, 1, "load resets the pointer");
 
         // An empty load is rejected.
-        assert!(s.load_boards(vec![], None).await.is_err());
+        assert!(s.load_boards(vec![], None, None).await.is_err());
     }
 
     #[tokio::test]
@@ -2146,7 +2182,7 @@ mod tests {
             vec![],
             0,
         );
-        s.load_boards(parse_boards(TWO_BOARDS).unwrap(), Some("Set".into()))
+        s.load_boards(parse_boards(TWO_BOARDS).unwrap(), Some("Set".into()), None)
             .await
             .unwrap();
         assert_eq!(s.table_count().await, 0, "loading a source makes no tables");
@@ -2322,5 +2358,47 @@ mod tests {
         // New tables inherit it.
         let r = s.add_room().await;
         assert_eq!(r.bot_mode().as_str(), "random");
+    }
+
+    #[tokio::test]
+    async fn load_boards_carries_board_mode_and_new_tables_inherit() {
+        use crate::rooms::BoardMode;
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        assert_eq!(
+            room_at(&s, 0).await.state.lock().await.board_mode,
+            BoardMode::BidAndPlay,
+            "default is bid-and-play"
+        );
+        // Loading a set WITH a mode (the client's "play the hand" choice)
+        // applies it to every existing table…
+        s.load_boards(
+            parse_boards(TWO_BOARDS).unwrap(),
+            Some("Set".into()),
+            Some(BoardMode::BidOnly),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.board_mode(), BoardMode::BidOnly);
+        assert_eq!(
+            room_at(&s, 0).await.state.lock().await.board_mode,
+            BoardMode::BidOnly,
+            "existing table updated"
+        );
+        // …and new tables inherit it.
+        let r = s.add_room().await;
+        assert_eq!(r.state.lock().await.board_mode, BoardMode::BidOnly);
+        // A later load WITHOUT a mode leaves the chosen mode untouched.
+        s.load_boards(
+            parse_boards(TWO_BOARDS).unwrap(),
+            Some("Again".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.board_mode(),
+            BoardMode::BidOnly,
+            "absent mode keeps the current mode"
+        );
     }
 }
