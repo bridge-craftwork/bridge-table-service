@@ -100,9 +100,31 @@ pub fn ensure_keepalive(room: Arc<Room>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            sweep_reservations(&room).await;
             kick(room.clone());
         }
     });
+}
+
+/// Release any expired seat reservations (friendship Phase 4) and, if any went,
+/// re-broadcast the seats so a stale "reserved" chip clears; the following
+/// `kick` lets a bot take the freed seat. Piggybacks on the keepalive tick so
+/// there's no extra timer.
+async fn sweep_reservations(room: &Arc<Room>) {
+    let changed = {
+        let mut inner = room.state.lock().await;
+        !inner.sweep_reservations(Instant::now()).is_empty()
+    };
+    if changed {
+        let ev = {
+            let inner = room.state.lock().await;
+            crate::routes::ws::seats_event(room, &inner)
+        };
+        room.broadcast(ev);
+        if let Some(session) = room.session() {
+            session.notify_lobby();
+        }
+    }
 }
 
 /// Kick the bot driver for a room. Cheap to call after every state change;

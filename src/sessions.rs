@@ -41,6 +41,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use bridge_types::Direction;
 use serde_json::{json, Value};
@@ -555,6 +556,46 @@ impl Session {
         }
         self.notify_lobby();
     }
+    // ── Seat reservations / invitations (friendship Phase 4) ────────────────
+    // Driven by the Mac API over the admin channel AFTER it verifies the
+    // friendship — the table service has no friend graph, so it only holds the
+    // seat. Targets the session's watch table (the adhoc host-a-table has one
+    // room); multi-table reservation targeting is a later concern.
+
+    /// Hold `seat` for an invited friend (`sub` = their future ticket subject)
+    /// for `ttl`. Returns the affected room (so the caller broadcasts the seats
+    /// change) or an error if the seat is already occupied.
+    pub async fn reserve_seat(
+        &self,
+        seat: Direction,
+        sub: &str,
+        name: &str,
+        ttl: Duration,
+    ) -> Result<Arc<Room>, String> {
+        let rooms = self.rooms_snapshot().await;
+        let room = self.watch_table(&rooms).await;
+        let expires_at = Instant::now() + ttl;
+        let ok = room
+            .state
+            .lock()
+            .await
+            .try_reserve(seat, sub, name, expires_at);
+        if ok {
+            Ok(room)
+        } else {
+            Err("seat is occupied".to_string())
+        }
+    }
+
+    /// Release a reservation on `seat` (decline / host-cancel / timeout). Returns
+    /// the affected room and whether a reservation was actually present.
+    pub async fn cancel_reservation(&self, seat: Direction) -> (Arc<Room>, bool) {
+        let rooms = self.rooms_snapshot().await;
+        let room = self.watch_table(&rooms).await;
+        let removed = room.state.lock().await.cancel_reservation(seat);
+        (room, removed)
+    }
+
     pub fn bots_paused(&self) -> bool {
         self.bots_paused.load(Ordering::SeqCst)
     }
@@ -878,6 +919,26 @@ impl Session {
                     room: room.clone(),
                     seat: Some(seat),
                 };
+            }
+        }
+        // 1.5. Redeem a seat reservation: a ticket whose `sub` matches a live
+        //    reservation (a friend the host invited) seats directly into it, the
+        //    reservation consumed on seat. Ranks just below reconnect so an
+        //    invitee always lands in the seat held for them.
+        {
+            let now = Instant::now();
+            for room in &rooms {
+                let mut inner = room.state.lock().await;
+                if let Some(seat) = inner.reserved_seat_for(sub, now) {
+                    inner.cancel_reservation(seat);
+                    if inner.try_seat(seat, sub, name) {
+                        return Placement {
+                            room: room.clone(),
+                            seat: Some(seat),
+                        };
+                    }
+                    // Seat taken by a human in the interim — fall through.
+                }
             }
         }
         // 2. Returning lobby member keeps their table + parked state (never
@@ -2358,6 +2419,50 @@ mod tests {
         // New tables inherit it.
         let r = s.add_room().await;
         assert_eq!(r.bot_mode().as_str(), "random");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_matching_a_reservation_seats_directly() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
+        // Host reserves North for an invited friend.
+        let room = s
+            .reserve_seat(
+                Direction::North,
+                "u-friend",
+                "Alice",
+                Duration::from_secs(120),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            room.state.lock().await.seats_json()["N"]["kind"],
+            "reserved"
+        );
+        // The friend joins with their sub → lands in North, reservation consumed.
+        let placement = s.place_seat("u-friend", "Alice", None).await;
+        assert_eq!(placement.seat, Some(Direction::North));
+        let inner = placement.room.state.lock().await;
+        assert_eq!(inner.seats.get(&Direction::North).unwrap().sub, "u-friend");
+        assert!(
+            inner.reservations.is_empty(),
+            "reservation consumed on seat"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserving_an_occupied_seat_is_rejected() {
+        let s = session(SessionKind::Adhoc, SeatPolicy::Manual, 1);
+        // Seat someone at South (owner-resume seats the owner at South).
+        let _ = s.place_seat("owner-1", "Host", None).await;
+        let err = s
+            .reserve_seat(
+                Direction::South,
+                "u-friend",
+                "Alice",
+                Duration::from_secs(120),
+            )
+            .await;
+        assert!(err.is_err(), "cannot reserve an occupied seat");
     }
 
     #[tokio::test]

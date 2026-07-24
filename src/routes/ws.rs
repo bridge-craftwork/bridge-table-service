@@ -137,7 +137,7 @@ async fn broadcast_roster(session: &Session) {
     }
 }
 
-fn seats_event(room: &Room, inner: &crate::rooms::RoomInner) -> String {
+pub(crate) fn seats_event(room: &Room, inner: &crate::rooms::RoomInner) -> String {
     json!({
         "t": "event",
         "table_id": room.id,
