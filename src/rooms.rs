@@ -602,6 +602,7 @@ pub fn random_board(number: u32) -> BoardSetup {
         dealer: Direction::ALL[((number.max(1) - 1) % 4) as usize],
         vulnerable: vulnerability_for(number),
         deal,
+        play_line: None,
     }
 }
 
@@ -617,6 +618,7 @@ pub fn board_from_pbn(pbn: &str, rotate: u8, number: u32) -> Result<BoardSetup, 
         dealer: b.dealer.unwrap_or(Direction::North),
         vulnerable: b.vulnerable,
         deal: b.deal.clone(),
+        play_line: crate::table::PlayLine::from_sequence(b.play.as_ref()),
     };
     if setup.deal.total_cards() != 52 {
         return Err(format!(
@@ -642,6 +644,10 @@ fn rotate_board_one(b: BoardSetup) -> BoardSetup {
         dealer: b.dealer.next(),
         vulnerable: b.vulnerable,
         deal,
+        // A rotation moves each hand to a new seat; the recorded line's seat
+        // assignments no longer match, so drop it (coaching boards aren't
+        // rotated in practice).
+        play_line: None,
     }
 }
 
@@ -658,6 +664,7 @@ pub fn placeholder_board() -> BoardSetup {
         dealer: b.dealer.unwrap_or(Direction::North),
         vulnerable: b.vulnerable,
         deal: b.deal.clone(),
+        play_line: None,
     }
 }
 
@@ -672,6 +679,7 @@ fn demo_board() -> BoardSetup {
         dealer: b.dealer.unwrap_or(Direction::North),
         vulnerable: b.vulnerable,
         deal: b.deal.clone(),
+        play_line: None,
     }
 }
 

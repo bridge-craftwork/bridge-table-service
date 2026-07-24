@@ -33,7 +33,7 @@ use serde_json::json;
 
 use crate::engine::auction;
 use crate::rooms::{BotMode, Room};
-use crate::table::{Action, BoardSetup, Phase};
+use crate::table::{Action, BoardSetup, Phase, PlayLine};
 
 /// Pacing, matching the solo client's feel (useCardPlay.js): a beat between
 /// plays, a longer beat after a completed trick.
@@ -181,7 +181,9 @@ enum Pending {
     Bid {
         seat: Direction,
         seq: usize,
-        board: BoardSetup,
+        // Boxed to keep the enum small — a `BoardSetup` now carries an optional
+        // recorded play line, and `Play` is already boxed (clippy large-enum).
+        board: Box<BoardSetup>,
         calls: Vec<Call>,
         /// PassBot: this seat's side is set to always pass — skip BBA.
         pass: bool,
@@ -217,6 +219,29 @@ struct PlayPending {
     played_pairs: Vec<(Direction, Card)>,
     /// PBN contract string, e.g. "4S", "3N", "2HX".
     contract_pbn: String,
+    /// The deal source's recorded `[Play]` line, when it shipped one. Drives the
+    /// cardplay-first composite: follow the line while on-book, then hand off.
+    line: Option<PlayLine>,
+}
+
+impl PlayPending {
+    /// The recorded-line card for this seat, IF the play is still on-book AND
+    /// that card is currently legal. `None` — the trigger to hand off to the
+    /// room's real bot — when there is no line, the play has diverged from it,
+    /// the line has run out, or the scripted card isn't legal here (absence).
+    fn line_card(&self) -> Option<Card> {
+        let line = self.line.as_ref()?;
+        if line.diverged(&self.played_pairs) {
+            return None;
+        }
+        let count = self
+            .played_pairs
+            .iter()
+            .filter(|(s, _)| *s == self.seat)
+            .count();
+        let card = line.card_for(self.seat, count)?;
+        self.legal.contains(&card).then_some(card)
+    }
 }
 
 /// Make one bot action if it's a bot's turn. Returns false when it isn't
@@ -245,7 +270,7 @@ async fn act_once(room: &Room) -> bool {
             Phase::Bidding => Pending::Bid {
                 seat,
                 seq,
-                board: inner.table.board.clone(),
+                board: Box::new(inner.table.board.clone()),
                 calls: f.calls.clone(),
                 pass: inner.pass_sides.contains(&crate::sessions::Side::of(seat)),
             },
@@ -284,6 +309,7 @@ async fn act_once(room: &Room) -> bool {
                     calls: f.calls.clone(),
                     played_pairs: f.played.clone(),
                     contract_pbn: c.to_pbn(),
+                    line: board.play_line.clone(),
                 }))
             }
             Phase::Complete => return false,
@@ -323,21 +349,32 @@ async fn act_once(room: &Room) -> bool {
             (seq, Action::Call { seat, call }, via, false)
         }
         Pending::Play(p) => {
-            let (card, via) = match mode {
-                BotMode::Real => choose_card(&p).await,
-                BotMode::Random => (pick(&p.legal, p.seq), "random"),
-                BotMode::Rules => (rules_card(&p), "rules"),
-                // Slow mode mimics humans at N/S: rulebot card, then a
-                // random 3-10s think before it lands. E/W stay fast. The
-                // state lock is NOT held during the sleep and the seq guard
-                // below discards the play if a human acted meanwhile.
-                BotMode::Slow => {
-                    let card = rules_card(&p);
-                    if matches!(p.seat, Direction::North | Direction::South) {
-                        let think_ms = 3000 + (rand::random::<u64>() % 7000);
-                        tokio::time::sleep(Duration::from_millis(think_ms)).await;
+            // Cardplay-first: while the deal source's recorded [Play] line is
+            // still on-book, replay it verbatim regardless of bot mode (the
+            // frontend composite does the same by wrapping the selected bot).
+            // The instant `line` card skips even Slow mode's human-think delay —
+            // a scripted replay isn't the bot "thinking." Once play goes
+            // off-book (`line_card` → None) every remaining decision falls to the
+            // room's real bot below.
+            let (card, via) = if let Some(card) = p.line_card() {
+                (card, "line")
+            } else {
+                match mode {
+                    BotMode::Real => choose_card(&p).await,
+                    BotMode::Random => (pick(&p.legal, p.seq), "random"),
+                    BotMode::Rules => (rules_card(&p), "rules"),
+                    // Slow mode mimics humans at N/S: rulebot card, then a
+                    // random 3-10s think before it lands. E/W stay fast. The
+                    // state lock is NOT held during the sleep and the seq guard
+                    // below discards the play if a human acted meanwhile.
+                    BotMode::Slow => {
+                        let card = rules_card(&p);
+                        if matches!(p.seat, Direction::North | Direction::South) {
+                            let think_ms = 3000 + (rand::random::<u64>() % 7000);
+                            tokio::time::sleep(Duration::from_millis(think_ms)).await;
+                        }
+                        (card, "rules")
                     }
-                    (card, "rules")
                 }
             };
             (
@@ -654,10 +691,140 @@ mod tests {
                 (North, c(Suit::Spades, Rank::Three)),
             ],
             contract_pbn: "3N".to_string(),
+            line: None,
         };
         let first = rules_card(&p);
         assert_eq!(first, c(Suit::Spades, Rank::King), "third hand high");
         assert_eq!(rules_card(&p), first, "deterministic");
+    }
+
+    // ── Cardplay-first composite (recorded line first, real bot on divergence) ──
+
+    fn card(s: Suit, r: Rank) -> Card {
+        Card::new(s, r)
+    }
+
+    /// A recorded line — trick 1: W leads ♣2, N ♣3, E ♣A (wins), S ♣K; trick 2:
+    /// E leads ♦5, S ♦6, W ♦7, N ♦8. (`play_card` finishes a trick but doesn't
+    /// auto-lead the next, so start each trick with its winner explicitly.)
+    fn sample_line() -> PlayLine {
+        use bridge_types::{PlaySequence, Suit::*};
+        let mut seq = PlaySequence::new(West, None);
+        seq.start_trick(West);
+        for c in [
+            card(Clubs, Rank::Two),
+            card(Clubs, Rank::Three),
+            card(Clubs, Rank::Ace),
+            card(Clubs, Rank::King),
+        ] {
+            seq.play_card(c);
+        }
+        seq.start_trick(East);
+        for c in [
+            card(Diamonds, Rank::Five),
+            card(Diamonds, Rank::Six),
+            card(Diamonds, Rank::Seven),
+            card(Diamonds, Rank::Eight),
+        ] {
+            seq.play_card(c);
+        }
+        PlayLine::from_sequence(Some(&seq)).expect("non-empty line")
+    }
+
+    fn play_pending(
+        seat: Direction,
+        played: Vec<(Direction, Card)>,
+        legal: Vec<Card>,
+    ) -> PlayPending {
+        PlayPending {
+            seat,
+            seq: 0,
+            legal,
+            opening_lead: played.is_empty(),
+            decision_maker: seat,
+            declarer: South,
+            hand_pbn: String::new(),
+            dummy_pbn: String::new(),
+            dealer: North,
+            vul: Vulnerability::None,
+            ctx: String::new(),
+            played: String::new(),
+            remaining: vec![],
+            dummy_cards: vec![],
+            calls: vec![],
+            played_pairs: played,
+            contract_pbn: "3N".to_string(),
+            line: Some(sample_line()),
+        }
+    }
+
+    #[test]
+    fn line_card_follows_the_recorded_opening_lead() {
+        let p = play_pending(
+            West,
+            vec![],
+            vec![card(Suit::Clubs, Rank::Two), card(Suit::Hearts, Rank::Nine)],
+        );
+        assert_eq!(p.line_card(), Some(card(Suit::Clubs, Rank::Two)));
+    }
+
+    #[test]
+    fn line_card_follows_each_seat_while_on_book() {
+        // Trick 1 partway: W ♣2, N ♣3 down; E to play its scripted ♣A.
+        let played = vec![
+            (West, card(Suit::Clubs, Rank::Two)),
+            (North, card(Suit::Clubs, Rank::Three)),
+        ];
+        let p = play_pending(
+            East,
+            played,
+            vec![card(Suit::Clubs, Rank::Ace), card(Suit::Clubs, Rank::Queen)],
+        );
+        assert_eq!(p.line_card(), Some(card(Suit::Clubs, Rank::Ace)));
+    }
+
+    #[test]
+    fn line_card_hands_off_once_play_diverges() {
+        // North deviated on trick 1 (played ♣4, line said ♣3) — now off-book.
+        let played = vec![
+            (West, card(Suit::Clubs, Rank::Two)),
+            (North, card(Suit::Clubs, Rank::Four)),
+        ];
+        let p = play_pending(East, played, vec![card(Suit::Clubs, Rank::Ace)]);
+        assert_eq!(p.line_card(), None, "off-book → hand off to the real bot");
+    }
+
+    #[test]
+    fn line_is_undo_safe_recomputed_from_history() {
+        let line = sample_line();
+        let off_book = vec![
+            (West, card(Suit::Clubs, Rank::Two)),
+            (North, card(Suit::Clubs, Rank::Four)), // deviation
+        ];
+        assert!(line.diverged(&off_book));
+        // Rewind past the deviation: history is a clean on-book prefix again.
+        let rewound = vec![(West, card(Suit::Clubs, Rank::Two))];
+        assert!(!line.diverged(&rewound), "rewind puts play back on-book");
+    }
+
+    #[test]
+    fn line_card_hands_off_when_scripted_card_is_not_legal() {
+        // On-book history, but E can't legally play the scripted ♣A here.
+        let played = vec![
+            (West, card(Suit::Clubs, Rank::Two)),
+            (North, card(Suit::Clubs, Rank::Three)),
+        ];
+        let p = play_pending(East, played, vec![card(Suit::Diamonds, Rank::Five)]);
+        assert_eq!(
+            p.line_card(),
+            None,
+            "absence (scripted card illegal) → hand off"
+        );
+    }
+
+    #[test]
+    fn play_line_is_none_for_a_board_without_a_play_section() {
+        assert!(PlayLine::from_sequence(None).is_none());
     }
 
     /// Zombie-seat takeover through the driver's own gate: a fully human

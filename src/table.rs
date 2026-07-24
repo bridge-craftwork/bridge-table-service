@@ -6,7 +6,7 @@
 //! state can drift, and bot context always derives from the folded state.
 //! Sequence numbers are simply indices into the log.
 
-use bridge_types::{Call, Card, Deal, Direction, Suit, Vulnerability};
+use bridge_types::{Call, Card, Deal, Direction, PlaySequence, Suit, Vulnerability};
 use serde_json::{json, Value};
 
 use crate::engine::{auction, play};
@@ -19,6 +19,61 @@ pub enum Action {
     Play { seat: Direction, card: Card },
 }
 
+/// A deal source's recorded `[Play]` line, flattened into per-seat queues (the
+/// cards each seat is scripted to play, in order). This is the server twin of
+/// the frontend's `playLine.bySeat` (see `cardplayBots.js`): the cardplay-first
+/// composite bot follows it while the actual play still matches, then hands off
+/// to the room's real bot on divergence/absence. Seats index by
+/// `Direction::to_index()`.
+#[derive(Debug, Clone, Default)]
+pub struct PlayLine {
+    by_seat: [Vec<Card>; 4],
+}
+
+impl PlayLine {
+    /// Flatten a parsed `[Play]` section into per-seat queues, or `None` when
+    /// the board carries no line (the common case — random/BBA deals).
+    pub fn from_sequence(play: Option<&PlaySequence>) -> Option<Self> {
+        let play = play?;
+        let mut by_seat: [Vec<Card>; 4] = Default::default();
+        for trick in &play.tricks {
+            for pos in 0..4 {
+                if let Some(card) = trick.cards[pos] {
+                    by_seat[trick.player_at(pos).to_index()].push(card);
+                }
+            }
+        }
+        if by_seat.iter().all(Vec::is_empty) {
+            return None;
+        }
+        Some(Self { by_seat })
+    }
+
+    /// The card `seat` is scripted to play on its `i`-th turn, if the line
+    /// records one.
+    pub fn card_for(&self, seat: Direction, i: usize) -> Option<Card> {
+        self.by_seat[seat.to_index()].get(i).copied()
+    }
+
+    /// Whether the actual play has departed from the recorded line — a seat
+    /// played a card the line didn't script at that position (a deviation), or
+    /// played past the end of its recorded queue (the line ran out). Recomputed
+    /// from the full history each call, so it is undo-safe: a rewind past the
+    /// divergence puts play back on-book. `played` is the chronological
+    /// all-seats history.
+    pub fn diverged(&self, played: &[(Direction, Card)]) -> bool {
+        let mut counts = [0usize; 4];
+        for (seat, card) in played {
+            let idx = seat.to_index();
+            match self.by_seat[idx].get(counts[idx]) {
+                Some(expected) if expected == card => counts[idx] += 1,
+                _ => return true,
+            }
+        }
+        false
+    }
+}
+
 /// The board being played (deal + context), fixed for the lifetime of the log.
 #[derive(Debug, Clone)]
 pub struct BoardSetup {
@@ -26,6 +81,11 @@ pub struct BoardSetup {
     pub dealer: Direction,
     pub vulnerable: Vulnerability,
     pub deal: Deal,
+    /// The recorded `[Play]` line, when the deal source shipped one (declarer-
+    /// play coaching boards). Drives the cardplay-first composite bot; `None`
+    /// for random/BBA deals and after a seat rotation (the line's seats no
+    /// longer match).
+    pub play_line: Option<PlayLine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +430,7 @@ mod tests {
             dealer: North,
             vulnerable: Vulnerability::None,
             deal: Deal::from_pbn(DEAL).unwrap(),
+            play_line: None,
         })
     }
 
