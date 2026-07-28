@@ -2506,4 +2506,41 @@ mod tests {
             "absent mode keeps the current mode"
         );
     }
+
+    #[tokio::test]
+    async fn set_board_mode_flips_live_without_resetting_board_number() {
+        use crate::rooms::BoardMode;
+        let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
+        s.load_boards(
+            parse_boards(TWO_BOARDS).unwrap(),
+            Some("Set".into()),
+            Some(BoardMode::BidOnly),
+        )
+        .await
+        .unwrap();
+        // Advance to board 2 so we can prove a live mode flip doesn't reset it.
+        s.goto_board(2).await;
+        assert_eq!(s.deck_status().await.1, 2, "on board 2");
+        assert_eq!(s.board_mode(), BoardMode::BidOnly);
+
+        // Flip to bid-and-play LIVE — the mode changes on the session + the room,
+        // and the board number stays put (no re-deal / reset to board 1).
+        s.set_board_mode(BoardMode::BidAndPlay).await;
+        assert_eq!(s.board_mode(), BoardMode::BidAndPlay);
+        assert_eq!(
+            room_at(&s, 0).await.state.lock().await.board_mode,
+            BoardMode::BidAndPlay,
+            "room's live board mode flipped"
+        );
+        assert_eq!(
+            s.deck_status().await.1,
+            2,
+            "board number unchanged after a live mode flip"
+        );
+
+        // …and back to bid-only, still board 2.
+        s.set_board_mode(BoardMode::BidOnly).await;
+        assert_eq!(s.board_mode(), BoardMode::BidOnly);
+        assert_eq!(s.deck_status().await.1, 2, "still board 2");
+    }
 }
