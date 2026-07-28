@@ -728,7 +728,10 @@ async fn handle_teacher_msg(
         // bid-only board re-folds into Play. Resync so seated players see it.
         Some("set_board_mode") => {
             let Some(mode) = v["mode"].as_str().and_then(crate::rooms::BoardMode::parse) else {
-                return Some(err_msg("bad_mode", "set_board_mode.mode missing or invalid"));
+                return Some(err_msg(
+                    "bad_mode",
+                    "set_board_mode.mode missing or invalid",
+                ));
             };
             session.set_board_mode(mode).await;
             for room in session.rooms_snapshot().await {
