@@ -658,6 +658,7 @@ fn is_host_control(v: &Value) -> bool {
             | Some("add_tables")
             | Some("set_seat_policy")
             | Some("set_bot_mode")
+            | Some("set_board_mode")
             | Some("pause_bots")
             | Some("assign_seat")
             | Some("boot")
@@ -720,6 +721,20 @@ async fn handle_teacher_msg(
                 Ok(_) => None,
                 Err(e) => Some(err_msg("rejected", &e)),
             }
+        }
+        // Flip the board mode LIVE (bid-and-play ↔ bid-only) without touching the
+        // deck or board number. Phase is derived from board_mode, so a mid-auction
+        // change transitions into play at auction end, and an already-complete
+        // bid-only board re-folds into Play. Resync so seated players see it.
+        Some("set_board_mode") => {
+            let Some(mode) = v["mode"].as_str().and_then(crate::rooms::BoardMode::parse) else {
+                return Some(err_msg("bad_mode", "set_board_mode.mode missing or invalid"));
+            };
+            session.set_board_mode(mode).await;
+            for room in session.rooms_snapshot().await {
+                room.broadcast_resync();
+            }
+            None
         }
         Some("goto_board") => {
             let Some(n) = v["index"].as_u64() else {
