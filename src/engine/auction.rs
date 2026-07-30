@@ -1,10 +1,10 @@
 //! Auction legality and contract determination.
 //!
-//! `bridge-types` provides the `Call`/`Auction` types and a
-//! `final_contract()`, but its declarer is "the player who made the last
-//! bid" — a simplification fine for rendering teaching materials, wrong for
-//! a live game (the declarer is the *first* player of the declaring side to
-//! name the final strain). `contract()` here implements the real rule.
+//! `bridge-types` provides the `Call`/`Auction` types and resolves the final
+//! contract, including the declarer (the *first* player of the declaring side
+//! to name the final strain). `contract()` here wraps that with the
+//! liveness rule a real table needs — no contract until the auction is over.
+//! Bid legality, which `bridge-types` does not model, is implemented here.
 
 use bridge_types::{Call, Direction, Strain};
 
@@ -70,49 +70,28 @@ pub fn is_legal(dealer: Direction, calls: &[Call], call: &Call) -> bool {
     }
 }
 
-/// The final contract with the *correct* declarer: the first player of the
-/// declaring side (in call order) to name the final strain. Returns `None`
-/// while the auction is incomplete or if the deal passed out.
+/// The final contract, or `None` while the auction is incomplete or if the
+/// deal passed out.
+///
+/// Resolution is delegated to `bridge_types::Auction::final_contract()`; all
+/// this adds is the liveness guard (a contract exists only once the auction
+/// has actually ended) and the mapping into [`ContractOutcome`].
 pub fn contract(dealer: Direction, calls: &[Call]) -> Option<ContractOutcome> {
     if !is_complete(calls) {
         return None;
     }
-    let (level, strain, last_bidder_idx) = last_bid(calls)?;
-    let bidding_side_parity = last_bidder_idx % 2;
 
-    // Doubled state: scan calls after the final bid.
-    let mut doubled = false;
-    let mut redoubled = false;
-    for c in &calls[last_bidder_idx + 1..] {
-        match c {
-            Call::Double => {
-                doubled = true;
-                redoubled = false;
-            }
-            Call::Redouble => {
-                doubled = false;
-                redoubled = true;
-            }
-            _ => {}
-        }
+    let mut auction = bridge_types::Auction::new(dealer);
+    for call in calls {
+        auction.add_call(call.clone());
     }
 
-    // Declarer: first caller on the declaring side who bid this strain.
-    let declarer_idx = calls
-        .iter()
-        .enumerate()
-        .find(|(i, c)| {
-            i % 2 == bidding_side_parity && matches!(c, Call::Bid { strain: s, .. } if *s == strain)
-        })
-        .map(|(i, _)| i)
-        .unwrap_or(last_bidder_idx);
-
-    Some(ContractOutcome {
-        level,
-        strain,
-        doubled,
-        redoubled,
-        declarer: caller_at(dealer, declarer_idx),
+    auction.final_contract().map(|fc| ContractOutcome {
+        level: fc.level,
+        strain: fc.strain,
+        doubled: fc.doubled,
+        redoubled: fc.redoubled,
+        declarer: fc.declarer,
     })
 }
 
@@ -259,7 +238,6 @@ mod tests {
     #[test]
     fn declarer_is_first_to_name_strain_not_last_bidder() {
         // N opens 1NT, S raises to 3NT: declarer must be NORTH.
-        // (bridge-types' own final_contract() gets this wrong — it picks S.)
         let a = calls("1NT Pass 3NT Pass Pass Pass");
         let c = contract(North, &a).unwrap();
         assert_eq!(c.declarer, North);
