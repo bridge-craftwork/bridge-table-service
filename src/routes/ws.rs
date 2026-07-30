@@ -11,8 +11,7 @@
 //!                    (host-as-player) instead of the see-all controller,
 //!                    keeping the host-control frames from their seat), then
 //!                    {"t":"bid","call":"1H"} | {"t":"play","card":"SA"} |
-//!                    {"t":"undo","to_seq":N} | {"t":"ready_next_board"} |
-//!                    {"t":"pong"};
+//!                    {"t":"undo","to_seq":N} | {"t":"pong"};
 //!                    host only: {"t":"open_boards","count":N} |
 //!                    seat/token-addressed seat control (friends-table model):
 //!                    {"t":"assign_seat","table"?:ID,"seat":"S"|null,
@@ -699,8 +698,9 @@ async fn handle_teacher_msg(
             };
             let open = session.open_boards_to(count as usize).await;
             let total = session.deck_status().await.2;
-            // Tell every table (players see "next board available"), then
-            // move any table whose humans are already all ready.
+            // Tell every table (players see "next board available"). Nothing
+            // auto-advances: since ready-up was retired the host paces each
+            // table with force_advance.
             let rooms = session.rooms_snapshot().await;
             for room in &rooms {
                 room.broadcast(
@@ -713,9 +713,6 @@ async fn handle_teacher_msg(
                     })
                     .to_string(),
                 );
-            }
-            for room in &rooms {
-                session.try_advance(room, false).await;
             }
             session.notify_lobby();
             None
@@ -791,7 +788,7 @@ async fn handle_teacher_msg(
             let Some(room) = room else {
                 return Some(err_msg("bad_table", "force_advance.table unknown"));
             };
-            if session.try_advance(&room, true).await {
+            if session.advance(&room).await {
                 None
             } else {
                 Some(err_msg("rejected", "no more boards"))
@@ -1377,37 +1374,6 @@ async fn handle_client_msg(
                 Err(e) => Some(err_msg("rejected", &e)),
             }
         }
-        Some("ready_next_board") => {
-            if seats.is_empty() {
-                return Some(err_msg("not_seated", "kibitzers cannot ready up"));
-            }
-            let Some(session) = session else {
-                return Some(err_msg("no_session", "the demo table has no board rounds"));
-            };
-            let ev = {
-                let mut inner = room.state.lock().await;
-                // A connection may hold several seats — ready them all.
-                for s in seats {
-                    inner.ready.insert(*s);
-                }
-                json!({
-                    "t": "event",
-                    "table_id": room.id,
-                    "seq": inner.table.seq(),
-                    "kind": "ready_update",
-                    "ready": inner
-                        .ready
-                        .iter()
-                        .map(|d| d.to_char().to_string())
-                        .collect::<Vec<_>>(),
-                })
-                .to_string()
-            };
-            room.broadcast(ev);
-            session.try_advance(room, false).await;
-            session.notify_lobby();
-            None
-        }
         Some("deal") => {
             // Deal-source controls (roadmap Phase 2). Demo room only: any
             // seated player may re-deal; session boards stay owned by the
@@ -1493,7 +1459,6 @@ async fn handle_client_msg(
                         ))
                     }
                 }
-                inner.ready.clear();
                 json!({
                     "t": "event",
                     "table_id": room.id,
