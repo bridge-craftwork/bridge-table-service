@@ -325,8 +325,7 @@ impl Room {
 }
 
 impl RoomInner {
-    /// Seat `sub` at the first free seat (S, W, N, E — South first so the
-    /// solo learner lands in the traditional student seat). If the sub was
+    /// Seat `sub` at the first free seat in the order N, S, W, E. If the sub was
     /// already seated (reconnect), rebind that seat instead.
     pub fn seat_or_rebind(&mut self, sub: &str, name: &str) -> Option<Direction> {
         use Direction::*;
@@ -337,7 +336,16 @@ impl RoomInner {
             occ.name = name.to_string();
             return Some(seat);
         }
-        for seat in [South, West, North, East] {
+        // Fill order N, S, W, E (Rick, 2026-07-30). The session owner is seated at South
+        // explicitly (`place_seat`), so in practice the FIRST arrival takes North — the
+        // owner's PARTNER — and bots hold the opposition. Two friends at a table end up
+        // playing together, which is what they came for; the old South-first order
+        // handed the first guest West, an opponent.
+        //
+        // A seat is taken only when it has no OCCUPANT, and an unoccupied seat is
+        // exactly what "a bot plays it" means here — so this fills bot seats and can
+        // never displace a person. A fifth arrival gets None and kibitzes.
+        for seat in [North, South, West, East] {
             if let std::collections::hash_map::Entry::Vacant(e) = self.seats.entry(seat) {
                 e.insert(Occupant {
                     sub: sub.to_string(),
@@ -842,11 +850,13 @@ mod tests {
             reservations: HashMap::new(),
             pass_sides: HashSet::new(),
         };
-        assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
-        assert_eq!(inner.seat_or_rebind("u2", "Bob"), Some(Direction::West));
+        // N, S, W, E: with the owner pinned to South by place_seat, the first arrival
+        // lands at North — partnering the host rather than opposing them.
+        assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::North));
+        assert_eq!(inner.seat_or_rebind("u2", "Bob"), Some(Direction::South));
         // Reconnect keeps the seat.
-        assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::South));
-        assert_eq!(inner.seat_or_rebind("u3", "Cam"), Some(Direction::North));
+        assert_eq!(inner.seat_or_rebind("u1", "Alice"), Some(Direction::North));
+        assert_eq!(inner.seat_or_rebind("u3", "Cam"), Some(Direction::West));
         assert_eq!(inner.seat_or_rebind("u4", "Dee"), Some(Direction::East));
         // Fifth person kibitzes.
         assert_eq!(inner.seat_or_rebind("u5", "Eve"), None);
@@ -910,8 +920,18 @@ mod tests {
             reservations: HashMap::new(),
             pass_sides: HashSet::new(),
         };
-        for sub in subs {
-            inner.seat_or_rebind(sub, sub);
+        // Seat EXPLICITLY (S, W, N, E) rather than through seat_or_rebind. These tests
+        // are about takeover/grace/bot-control at a given seat, not about arrival
+        // order — coupling them to the fill order meant changing that order (N,S,W,E,
+        // 2026-07-30) broke ten tests that had no opinion on it. `seat_order_and_kibitz`
+        // is where the fill order itself is pinned.
+        for (sub, seat) in subs.iter().zip([
+            Direction::South,
+            Direction::West,
+            Direction::North,
+            Direction::East,
+        ]) {
+            inner.try_seat(seat, sub, sub);
         }
         inner
     }
