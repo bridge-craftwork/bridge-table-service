@@ -1490,7 +1490,12 @@ impl Session {
                         "card": format!("{}{}", c.suit.to_char(), c.rank.to_char()),
                     })).collect::<Vec<_>>(),
                 })),
-                "result": inner.table.board_result_json(),
+                // The MODE-AWARE result (RoomInner::result_json), not the
+                // table's raw one: a bid-only board is finished the moment the
+                // auction lands a contract, but its fold still reads phase
+                // Play, so the raw call returned null and the monitor showed
+                // such tables as forever mid-play with no result.
+                "result": inner.result_json(),
             }));
         }
         let kibitzers: Vec<Value> = {
