@@ -859,8 +859,11 @@ mod tests {
         let room = crate::rooms::Room::new_for_test("t");
         {
             let mut inner = room.state.lock().await;
-            for sub in ["u1", "u2", "u3", "u4"] {
-                inner.seat_or_rebind(sub, sub); // S, W, N, E
+            // Seat explicitly so the premise below ("North is u3, and North is on
+            // turn") doesn't ride on the arrival fill order.
+            use Direction::*;
+            for (sub, seat) in ["u1", "u2", "u3", "u4"].iter().zip([South, West, North, East]) {
+                inner.try_seat(seat, sub, sub);
             }
         }
         // Demo board's dealer is North (= "u3"), so North is on turn.

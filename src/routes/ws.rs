@@ -336,6 +336,24 @@ async fn handle_player(socket: WebSocket, state: SharedState, session: Arc<Sessi
                     let _ = tx.send(Message::Text(err_msg("bad_json", "unparseable message"))).await;
                     continue;
                 };
+                // Leaving ON PURPOSE is not the same as vanishing. A closed tab keeps
+                // the seat (zombie-seat policy: a reconnect rebinds it, a bot covers
+                // after the grace) — right for a dropped connection, but it leaves the
+                // host watching a seat that still bears your name, with no way to tell
+                // you've gone (2026-07-30: "david never saw that i had disconnected").
+                // An explicit leave VACATES: the seat empties, a bot takes it and the
+                // roster drops you — at once, and visibly to everyone at the table.
+                if v["t"].as_str() == Some("leave") {
+                    let mut inner = room.state.lock().await;
+                    for seat in &seats {
+                        inner.vacate(*seat);
+                    }
+                    let ev = seats_event(&room, &inner);
+                    drop(inner);
+                    room.broadcast(ev);
+                    session.notify_recheck();
+                    break; // then close; the disconnect path below drops the connection
+                }
                 // A seated HOST (owner or teacher-role): bid/play/undo run
                 // through their seat(s), but host control frames (deal source,
                 // seating, bots) dispatch to the same handler the console uses.
@@ -1541,7 +1559,9 @@ mod tests {
     fn snapshot_includes_state_and_seats() {
         let room = crate::rooms::Room::new_for_test("t1");
         let mut inner = room.state.try_lock().unwrap();
-        inner.seat_or_rebind("u1", "Alice");
+        // Seat explicitly: this test is about the snapshot carrying one human and one
+        // bot seat, not about which seat the fill order picks.
+        inner.try_seat(Direction::South, "u1", "Alice");
         let msg = snapshot_msg("t1", &inner, &json!([]));
         let v: Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(v["t"], "snapshot");
