@@ -925,10 +925,12 @@ mod tests {
         // order — coupling them to the fill order meant changing that order (N,S,W,E,
         // 2026-07-30) broke ten tests that had no opinion on it. `seat_order_and_kibitz`
         // is where the fill order itself is pinned.
-        for (sub, seat) in subs
-            .iter()
-            .zip([Direction::South, Direction::West, Direction::North, Direction::East])
-        {
+        for (sub, seat) in subs.iter().zip([
+            Direction::South,
+            Direction::West,
+            Direction::North,
+            Direction::East,
+        ]) {
             inner.try_seat(seat, sub, sub);
         }
         inner

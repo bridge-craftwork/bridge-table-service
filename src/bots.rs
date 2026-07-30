@@ -862,7 +862,10 @@ mod tests {
             // Seat explicitly so the premise below ("North is u3, and North is on
             // turn") doesn't ride on the arrival fill order.
             use Direction::*;
-            for (sub, seat) in ["u1", "u2", "u3", "u4"].iter().zip([South, West, North, East]) {
+            for (sub, seat) in ["u1", "u2", "u3", "u4"]
+                .iter()
+                .zip([South, West, North, East])
+            {
                 inner.try_seat(seat, sub, sub);
             }
         }
