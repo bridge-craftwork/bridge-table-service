@@ -32,11 +32,15 @@
 //!
 //! `boards[0..open_boards]` are open. `teacher_set` sessions start with 1
 //! open board and the teacher widens the window with `open_boards{count}`
-//! (Shark-style rounds); `adhoc` sessions open everything up front so the
-//! only gate is all-humans-ready. A table advances (fresh `TableState`,
-//! cleared BBA cache, per-viewer snapshot resync) when every *connected
-//! seated human* has sent `ready_next_board` and the next board is open —
-//! or when the teacher `force_advance`s it (which skips both checks).
+//! (Shark-style rounds); `adhoc` sessions open everything up front. A table
+//! advances (fresh `TableState`, cleared BBA cache, per-viewer snapshot
+//! resync) ONLY when the host/teacher says so — `force_advance` for one
+//! table, `deal_index_to_all` for the whole session in lockstep.
+//!
+//! Ready-up was retired 2026-07-30 (roadmap §1.1): it gated the advance on
+//! every connected seated human having sent `ready_next_board`, which let one
+//! idle-but-connected player stall a table until the host intervened — the
+//! very intervention it was meant to remove.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,7 +67,7 @@ pub enum SessionKind {
     /// Teacher-run class set: rounds are teacher-gated (starts with board 1
     /// open).
     TeacherSet,
-    /// Friends' table(s): every board is open; tables advance on all-ready.
+    /// Friends' table(s): every board is open; the host paces the table.
     Adhoc,
 }
 
@@ -1274,14 +1278,13 @@ impl Session {
             .max(clamped)
     }
 
-    /// Advance `room` to its next board if allowed (see module docs), or
-    /// unconditionally when `force`. Returns true if the board changed.
-    /// **teacher_set never self-advances** — it's teacher-driven lockstep
-    /// (`deal_index_to_all`); the auto path here is the adhoc round flow.
-    /// On advance: fresh TableState, cleared ready set + BBA cache,
+    /// Advance `room` to its next board. Host-driven only (see module docs):
+    /// the sole caller is the `force_advance` command, since ready-up was
+    /// retired. Returns true if the board changed — false only when the set
+    /// is exhausted. On advance: fresh TableState, cleared BBA cache,
     /// `board_advanced` event + per-viewer snapshot resync, lobby refresh,
     /// bot kick.
-    pub async fn try_advance(&self, room: &Arc<Room>, force: bool) -> bool {
+    pub async fn advance(&self, room: &Arc<Room>) -> bool {
         // Snapshot the loaded set (cheap Arc clone) so we never hold the deck
         // lock across a room lock — keeps the module's no-nested-locks rule.
         let boards = self.deck.lock().await.boards.clone();
@@ -1291,29 +1294,8 @@ impl Session {
             if next >= boards.len() {
                 return false;
             }
-            if !force {
-                // Lockstep: teacher_set tables move only on a teacher command.
-                if self.kind == SessionKind::TeacherSet {
-                    return false;
-                }
-                if next >= self.open_boards.load(Ordering::SeqCst) {
-                    return false; // waiting for the teacher's next round
-                }
-                // Every connected seated human must be ready — and there
-                // must be at least one (an all-bot table only force-advances).
-                let humans: Vec<Direction> = inner
-                    .seats
-                    .iter()
-                    .filter(|(_, o)| o.connected)
-                    .map(|(&s, _)| s)
-                    .collect();
-                if humans.is_empty() || !humans.iter().all(|s| inner.ready.contains(s)) {
-                    return false;
-                }
-            }
             inner.board_index = next;
             inner.table = TableState::new(boards[next].clone());
-            inner.ready.clear();
             json!({
                 "t": "event",
                 "table_id": room.id,
@@ -1321,7 +1303,7 @@ impl Session {
                 "kind": "board_advanced",
                 "board_no": boards[next].number,
                 "board_index": next,
-                "forced": force,
+                "forced": true,
             })
             .to_string()
         };
@@ -1390,8 +1372,8 @@ impl Session {
 
     /// Force every table to board `index` (0-based, clamped to the set).
     /// Lockstep — both directions, teacher-driven. Fresh TableState, cleared
-    /// ready + BBA cache, `board_advanced` (forced) + resync + lobby + bot
-    /// kick per room. Returns the new 1-based board number (0 if idle).
+    /// BBA cache, `board_advanced` (forced) + resync + lobby + bot kick per
+    /// room. Returns the new 1-based board number (0 if idle).
     async fn deal_index_to_all(&self, index: usize) -> usize {
         let (idx, board) = {
             let mut d = self.deck.lock().await;
@@ -1408,7 +1390,6 @@ impl Session {
                 let mut inner = room.state.lock().await;
                 inner.board_index = idx;
                 inner.table = TableState::new(board.clone());
-                inner.ready.clear();
             }
             *room.bba_cache.lock().await = None;
             room.broadcast(
@@ -1489,11 +1470,6 @@ impl Session {
                 "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
                 "next_to_act": f.next_to_act.map(|d| d.to_char().to_string()),
                 "seats": inner.seats_json(),
-                "ready": inner
-                    .ready
-                    .iter()
-                    .map(|d| d.to_char().to_string())
-                    .collect::<Vec<_>>(),
                 // Multi-table monitor payload (teacher-only feed): enough to
                 // render a live mini-table per room — dealer/vul, the
                 // auction, contract, each seat's remaining cards, and the
@@ -1761,16 +1737,8 @@ mod tests {
             2,
         );
         s.place("g1", "Ann").await; // t0 South
-        let room = room_at(&s, 0).await;
 
-        // Even ready + a widened window: teacher_set NEVER self-advances
-        // (it's teacher-driven lockstep).
-        room.state.lock().await.ready.insert(South);
         assert_eq!(s.open_boards_to(2).await, 2);
-        assert!(
-            !s.try_advance(&room, false).await,
-            "teacher_set is lockstep"
-        );
 
         // The teacher drives EVERY table together with next_board.
         assert_eq!(s.next_board().await, 2, "1-based board number");
@@ -1778,7 +1746,6 @@ mod tests {
             let inner = room.state.lock().await;
             assert_eq!(inner.board_index, 1);
             assert_eq!(inner.table.board.number, 2);
-            assert!(inner.ready.is_empty());
             assert_eq!(inner.table.seq(), 0, "fresh action log on the new board");
         }
 
@@ -1875,7 +1842,7 @@ mod tests {
             52
         );
         // No set → nothing advances, even forced.
-        assert!(!s.try_advance(&room_at(&s, 0).await, true).await);
+        assert!(!s.advance(&room_at(&s, 0).await).await);
         // Lobby reports the idle state.
         let lobby: Value = serde_json::from_str(&s.lobby_json().await).unwrap();
         assert_eq!(lobby["loaded"], false);
@@ -1884,59 +1851,39 @@ mod tests {
         assert_eq!(lobby["boards"]["index"], 0);
     }
 
+    // Ready-up retired (roadmap 2026-07-30 §1.1): the host's advance is the
+    // ONLY path, so nothing about WHO is seated — or how many of them are
+    // connected, or whether any human is seated at all — can gate it. These
+    // three cases each used to be blocked by the all-humans-ready gate.
     #[tokio::test]
-    async fn adhoc_opens_everything_advance_needs_all_ready() {
+    async fn advance_is_never_gated_by_the_seated_humans() {
+        // Two connected humans: no per-seat readying to wait on.
         let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
         s.place("g1", "Ann").await; // South
         s.place("g2", "Ben").await; // West
-        let room = room_at(&s, 0).await;
         assert_eq!(s.open_boards.load(Ordering::SeqCst), 2);
+        assert!(s.advance(&room_at(&s, 0).await).await);
 
-        room.state.lock().await.ready.insert(South);
-        assert!(
-            !s.try_advance(&room, false).await,
-            "one of two humans ready is not enough"
-        );
-        room.state.lock().await.ready.insert(West);
-        assert!(s.try_advance(&room, false).await);
-    }
-
-    #[tokio::test]
-    async fn disconnected_humans_do_not_block_advance() {
+        // One of them disconnected.
         let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
         s.place("g1", "Ann").await;
         s.place("g2", "Ben").await;
         let room = room_at(&s, 0).await;
-        {
-            let mut inner = room.state.lock().await;
-            inner.mark_disconnected("g2");
-            inner.ready.insert(South);
-        }
-        assert!(s.try_advance(&room, false).await);
-    }
+        room.state.lock().await.mark_disconnected("g2");
+        assert!(s.advance(&room).await);
 
-    #[tokio::test]
-    async fn all_bot_table_only_force_advances() {
+        // No humans at all (all-bot table).
         let s = session(SessionKind::Adhoc, SeatPolicy::FirstFree, 1);
-        let room = room_at(&s, 0).await;
-        assert!(
-            !s.try_advance(&room, false).await,
-            "no humans: no auto-advance"
-        );
-        assert!(s.try_advance(&room, true).await, "teacher force works");
-    }
+        assert!(s.advance(&room_at(&s, 0).await).await);
 
-    #[tokio::test]
-    async fn force_advance_ignores_the_round_gate() {
+        // And a teacher_set table, which the round window used to hold back.
         let s = session(
             SessionKind::TeacherSet,
             SeatPolicy::OnePerSeat(vec![South]),
             1,
         );
         s.place("g1", "Ann").await;
-        let room = room_at(&s, 0).await;
-        assert!(!s.try_advance(&room, false).await);
-        assert!(s.try_advance(&room, true).await);
+        assert!(s.advance(&room_at(&s, 0).await).await);
     }
 
     #[tokio::test]
@@ -2162,10 +2109,6 @@ mod tests {
             1,
         );
         s.place("g1", "Ann").await;
-        {
-            // A ready flag must not survive the vacate.
-            room_at(&s, 0).await.state.lock().await.ready.insert(South);
-        }
         // Vacate = from set, target None.
         let changed = s
             .assign_seat(Some("s1-t1"), None, Some(South), None, false)
@@ -2181,7 +2124,6 @@ mod tests {
         let r = room_at(&s, 0).await;
         let inner = r.state.lock().await;
         assert!(inner.seats.is_empty());
-        assert!(inner.ready.is_empty());
         drop(inner);
         // Vacating an empty seat is a no-op.
         assert!(s

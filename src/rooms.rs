@@ -223,11 +223,8 @@ pub struct RoomInner {
     pub table: TableState,
     pub seats: HashMap<Direction, Occupant>,
     /// Index into the owning session's board list (always 0 for the demo
-    /// room). The session's `try_advance` moves it forward.
+    /// room). The session's `advance` moves it forward.
     pub board_index: usize,
-    /// Seats that sent `ready_next_board` for the current board. Cleared on
-    /// advance and when a seat's occupant changes.
-    pub ready: HashSet<Direction>,
     /// How boards run at this table (see `BoardMode`).
     pub board_mode: BoardMode,
     /// Bot-takeover grace for this room's seats (see `TakeoverGrace`); set
@@ -265,7 +262,6 @@ impl Room {
                 table: TableState::new(board),
                 seats: HashMap::new(),
                 board_index: 0,
-                ready: HashSet::new(),
                 board_mode: BoardMode::default(),
                 takeover,
                 no_bot: HashSet::new(),
@@ -376,11 +372,10 @@ impl RoomInner {
 
     /// Place a pre-built occupant (preserves connected/disconnected state
     /// when the teacher moves someone between seats) iff the seat is
-    /// vacant. A newly placed occupant is never "ready".
+    /// vacant.
     pub fn try_place(&mut self, seat: Direction, occ: Occupant) -> bool {
         if let std::collections::hash_map::Entry::Vacant(e) = self.seats.entry(seat) {
             e.insert(occ);
-            self.ready.remove(&seat);
             self.no_bot.remove(&seat); // occupied → no longer an open seat
             true
         } else {
@@ -464,9 +459,8 @@ impl RoomInner {
     }
 
     /// Vacate a seat (teacher boot / assign away). Returns the removed
-    /// occupant. Also clears the seat's ready flag.
+    /// occupant.
     pub fn vacate(&mut self, seat: Direction) -> Option<Occupant> {
-        self.ready.remove(&seat);
         self.seats.remove(&seat)
     }
 
@@ -843,7 +837,6 @@ mod tests {
             table: TableState::new(board),
             seats: HashMap::new(),
             board_index: 0,
-            ready: HashSet::new(),
             board_mode: BoardMode::default(),
             takeover: TakeoverGrace::DEFAULT,
             no_bot: HashSet::new(),
@@ -913,7 +906,6 @@ mod tests {
             table: TableState::new(demo_board()),
             seats: HashMap::new(),
             board_index: 0,
-            ready: HashSet::new(),
             board_mode: BoardMode::default(),
             takeover: TakeoverGrace::DEFAULT,
             no_bot: HashSet::new(),
