@@ -42,7 +42,7 @@ Use SSH for all GitHub operations:
 
 ## Related Projects
 
-All located at `/Users/rick/Development/GitHub/`:
+All located at `/Volumes/Express2T/Development/GitHub/`:
 
 - `../bridge-types` — core bridge types (git dependency; local dev via gitignored `.cargo/config.toml` patch + `./dev-build.sh`)
 - `../bridge-encodings` — hand/board encodings (same arrangement)
