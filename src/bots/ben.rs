@@ -19,6 +19,14 @@
 //!   - `/play` responses carry a `player` field relative to declarer
 //!     (0 = LHO, 1 = dummy, 2 = RHO, 3 = declarer) naming whose card the
 //!     returned `card` is.
+//!   - `tournament` ("IMP" or "MP") is sent on every call. BEN up to
+//!     0.8.8.7 keeps the last `tournament` it was sent for later requests
+//!     that send none, and rusty-seat-service sends `MP` for Brill's
+//!     matchpoint events, so leaving it out would score our play as
+//!     whatever the previous caller asked for.
+
+/// The scoring BEN plays for. IMP is what BEN does when nothing is sent.
+const TOURNAMENT: &str = "IMP";
 
 use std::time::{Duration, Instant};
 
@@ -153,6 +161,7 @@ impl BenClient {
                     ("dealer", &dealer.to_char().to_string()),
                     ("vul", vul),
                     ("ctx", ctx),
+                    ("tournament", TOURNAMENT),
                 ],
             )
             .await?;
@@ -184,6 +193,7 @@ impl BenClient {
                     ("vul", vul),
                     ("ctx", ctx),
                     ("played", played),
+                    ("tournament", TOURNAMENT),
                 ],
             )
             .await?;
