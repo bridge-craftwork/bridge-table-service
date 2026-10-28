@@ -490,8 +490,10 @@ impl TableState {
                 })).collect::<Vec<_>>(),
             })),
             "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
-            // Every card played so far, in order — with the deal and contract,
-            // the position a client's claim checker needs.
+            // The original deal and every card played so far, in order: with
+            // the contract, the position a client's claim checker needs.
+            // (Every viewer already receives all four hands.)
+            "deal": self.board.deal.to_pbn(Direction::North),
             "plays": f.played.iter()
                 .map(|(_, c)| format!("{}{}", c.suit.to_char(), c.rank.to_char()))
                 .collect::<Vec<_>>(),
@@ -845,6 +847,7 @@ mod tests {
         assert_eq!(snap["phase"], "complete");
         assert_eq!(snap["claim"]["at_card"], 1);
         assert_eq!(snap["plays"], json!(["S2"]));
+        assert_eq!(snap["deal"], DEAL);
     }
 
     #[test]
