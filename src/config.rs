@@ -22,6 +22,10 @@ pub struct Config {
     /// Bearer token for the dealer service. Absent → the "script" deal
     /// source politely reports itself unavailable.
     pub dealer_token: Option<String>,
+    /// Re-check players' claims with bridge-solver before applying them
+    /// (`VERIFY_CLAIMS`, default on; `0`/`false` trusts the client's check).
+    /// Teacher rulings are never checked.
+    pub verify_claims: bool,
 }
 
 impl Config {
@@ -41,6 +45,12 @@ impl Config {
                 .context("BOT_TIMEOUT_MS")?,
             dealer_url: env_or("DEALER_URL", "http://bridge-dealer-service:8001"),
             dealer_token: std::env::var("DEALER_TOKEN").ok().filter(|s| !s.is_empty()),
+            verify_claims: !matches!(
+                env_or("VERIFY_CLAIMS", "true")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "false" | "off" | "no"
+            ),
         })
     }
 }
