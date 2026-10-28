@@ -11,7 +11,12 @@
 //!                    (host-as-player) instead of the see-all controller,
 //!                    keeping the host-control frames from their seat), then
 //!                    {"t":"bid","call":"1H"} | {"t":"play","card":"SA"} |
-//!                    {"t":"undo","to_seq":N} | {"t":"pong"};
+//!                    {"t":"undo","to_seq":N} | {"t":"pong"} |
+//!                    {"t":"claim","seat"?:"S","tricks":N,"plays_seen":K}
+//!                        (the claimer's side takes N of the tricks still to
+//!                        play; K = cards played when the client checked it,
+//!                        refused as `claim_stale` if the table differs; see
+//!                        claims.rs);
 //!                    host only: {"t":"open_boards","count":N} |
 //!                    seat/token-addressed seat control (friends-table model):
 //!                    {"t":"assign_seat","table"?:ID,"seat":"S"|null,
@@ -22,6 +27,8 @@
 //!                    {"t":"kick","token":TOKEN}  (remove a person entirely) |
 //!                    {"t":"set_pass_sides","sides":["NS","EW"]}  (PassBot) |
 //!                    {"t":"force_advance","table":ID} |
+//!                    {"t":"claim_ruling","table"?:ID,"seat":"S","tricks":N,
+//!                        "plays_seen":K}  (teacher-directed claim, unchecked) |
 //!                    {"t":"kibitz","table":ID} |
 //!                    runtime deal source + lockstep board nav (§Phase 3.1):
 //!                    {"t":"load_boards","boards_pbn":"…","label":"…"} |
@@ -77,6 +84,13 @@ pub fn router() -> Router<SharedState> {
 
 async fn upgrade(ws: WebSocketUpgrade, State(state): State<SharedState>) -> Response {
     ws.on_upgrade(move |socket| handle(socket, state))
+}
+
+/// A claim frame's `tricks` and `plays_seen`.
+fn claim_numbers(v: &Value) -> Option<(u8, usize)> {
+    let tricks = u8::try_from(v["tricks"].as_u64()?).ok()?;
+    let plays_seen = usize::try_from(v["plays_seen"].as_u64()?).ok()?;
+    Some((tricks, plays_seen))
 }
 
 fn parse_card(s: &str) -> Option<Card> {
@@ -670,6 +684,7 @@ fn is_host_control(v: &Value) -> bool {
             | Some("prev_board")
             | Some("open_boards")
             | Some("force_advance")
+            | Some("claim_ruling")
             | Some("seat_students")
             | Some("wait_to_seat")
             | Some("add_tables")
@@ -793,6 +808,40 @@ async fn handle_teacher_msg(
             } else {
                 Some(err_msg("rejected", "no more boards"))
             }
+        }
+        Some("claim_ruling") => {
+            // The teacher's claim for a seat at one table: "claimable",
+            // "makable" or "all" are worked out in the console's browser and
+            // arrive here as a trick count. A director's ruling — unchecked.
+            let room = match v["table"].as_str() {
+                Some(id) => session.room_by_id(id).await,
+                None => session.rooms_snapshot().await.first().cloned(),
+            };
+            let Some(room) = room else {
+                return Some(err_msg("bad_table", "claim_ruling.table unknown"));
+            };
+            let Some(seat) = v["seat"]
+                .as_str()
+                .and_then(|s| s.chars().next())
+                .and_then(Direction::from_char)
+            else {
+                return Some(err_msg("bad_claim", "claim_ruling.seat missing"));
+            };
+            let Some((tricks, plays_seen)) = claim_numbers(v) else {
+                return Some(err_msg("bad_claim", "claim needs tricks and plays_seen"));
+            };
+            crate::claims::make_claim(
+                &room,
+                crate::claims::ClaimRequest {
+                    seat,
+                    tricks,
+                    plays_seen,
+                    ruling: true,
+                },
+            )
+            .await
+            .err()
+            .map(|r| err_msg(r.code, &r.msg))
         }
         // ---- Dynamic tables + lobby (roadmap §Phase 3.2) ----
         Some("seat_students") => {
@@ -1167,6 +1216,51 @@ async fn handle_client_msg(
         | Some("force_advance")
         | Some("kick")
         | Some("set_pass_sides") => Some(err_msg("not_host", "seat management is host-only")),
+        Some("claim_ruling") => Some(err_msg("not_host", "claim rulings are host-only")),
+        Some("claim") => {
+            if seats.is_empty() {
+                return Some(err_msg("not_seated", "kibitzers cannot claim"));
+            }
+            let Some((tricks, plays_seen)) = claim_numbers(v) else {
+                return Some(err_msg("bad_claim", "claim needs tricks and plays_seen"));
+            };
+            // The claiming seat: the one named, else the sender's own. A
+            // declarer-side controller may claim for declarer or dummy (both
+            // see the same two hands).
+            let seat = match v["seat"].as_str() {
+                Some(s) => match s.chars().next().and_then(Direction::from_char) {
+                    Some(d) => d,
+                    None => return Some(err_msg("bad_claim", "unknown seat")),
+                },
+                None => seats[0],
+            };
+            let entitled = seats.contains(&seat) || {
+                let inner = room.state.lock().await;
+                inner.table.fold().contract.as_ref().is_some_and(|c| {
+                    (seat == c.declarer || seat == c.dummy())
+                        && seats.contains(&inner.declarer_side_controller(
+                            c.declarer,
+                            true,
+                            std::time::Instant::now(),
+                        ))
+                })
+            };
+            if !entitled {
+                return Some(err_msg("rejected", "you can only claim for your own side"));
+            }
+            crate::claims::make_claim(
+                room,
+                crate::claims::ClaimRequest {
+                    seat,
+                    tricks,
+                    plays_seen,
+                    ruling: false,
+                },
+            )
+            .await
+            .err()
+            .map(|r| err_msg(r.code, &r.msg))
+        }
         Some("bid") => {
             if seats.is_empty() {
                 return Some(err_msg("not_seated", "kibitzers cannot bid"));

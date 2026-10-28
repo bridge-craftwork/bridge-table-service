@@ -7,6 +7,7 @@ use tower_http::trace::TraceLayer;
 
 mod auth;
 mod bots;
+mod claims;
 mod config;
 mod db;
 mod dealer;
@@ -31,6 +32,7 @@ pub type SharedState = Arc<AppState>;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = config::Config::from_env()?;
+    claims::set_verify(cfg.verify_claims);
 
     observability::logging::init(&cfg.log_level, &cfg.log_format);
     observability::metrics::init();

@@ -462,6 +462,11 @@ async fn act_once(room: &Room) -> bool {
                 "tricks": { "ns": f2.tricks_ns, "ew": f2.tricks_ew },
             })
         }
+        // Bots never claim (yet): their suggestions are calls and cards.
+        Action::Claim { .. } => {
+            tracing::error!(event = "bot_action_rejected", error = "bot claim", "");
+            return false;
+        }
     };
 
     let trick_pause = event["trick_winner"].is_string();

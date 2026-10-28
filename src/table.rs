@@ -15,8 +15,39 @@ use crate::engine::{auction, play};
 /// re-derive who acted, and so the log is self-describing for later replay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Call { seat: Direction, call: Call },
-    Play { seat: Direction, card: Card },
+    Call {
+        seat: Direction,
+        call: Call,
+    },
+    Play {
+        seat: Direction,
+        card: Card,
+    },
+    /// A claim that ends the play: the claiming seat's side takes `tricks` of
+    /// the tricks still to play (counting the one in progress) and the other
+    /// side the rest. `tricks == 0` is a concession. The claim was checked by
+    /// the claimer's client (bridge-solver's claim checker, in WASM) and
+    /// optionally again here; `ruling` marks a teacher-directed claim, which
+    /// is a director's ruling and is not checked.
+    Claim {
+        seat: Direction,
+        tricks: u8,
+        ruling: bool,
+    },
+}
+
+/// A claim as the fold sees it: who claimed, what they claimed, and where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimRecord {
+    pub seat: Direction,
+    /// Tricks the claimer's side takes, of those still to play.
+    pub tricks: u8,
+    /// Teacher-directed (not checked).
+    pub ruling: bool,
+    /// The trick the claim was made during, 1-based.
+    pub at_trick: usize,
+    /// Cards played before the claim.
+    pub at_card: usize,
 }
 
 /// A deal source's recorded `[Play]` line, flattened into per-seat queues (the
@@ -112,6 +143,19 @@ pub struct Folded {
     pub next_to_act: Option<Direction>,
     /// True once the opening lead has been made (dummy goes face up).
     pub opening_lead_made: bool,
+    /// The claim that ended the play, if one did.
+    pub claim: Option<ClaimRecord>,
+}
+
+impl Folded {
+    /// Tricks still to play, counting the one in progress (0 once complete).
+    pub fn tricks_left(&self) -> u8 {
+        if self.phase == Phase::Complete {
+            0
+        } else {
+            13 - self.completed_tricks.len() as u8
+        }
+    }
 }
 
 pub struct TableState {
@@ -167,6 +211,15 @@ impl TableState {
                     ));
                 }
             }
+            Action::Claim { tricks, .. } => {
+                if f.phase != Phase::Play {
+                    return Err("claims are only made during the play".into());
+                }
+                let left = f.tricks_left();
+                if *tricks > left {
+                    return Err(format!("claimed {tricks} tricks but only {left} remain"));
+                }
+            }
         }
         self.actions.push(action);
         Ok(self.actions.len())
@@ -196,10 +249,18 @@ impl TableState {
     pub fn fold(&self) -> Folded {
         let mut calls: Vec<Call> = Vec::new();
         let mut played: Vec<(Direction, Card)> = Vec::new();
+        // (seat, tricks, ruling, cards played before it). `apply` refuses
+        // anything after a claim, so it is always the last action.
+        let mut claim: Option<(Direction, u8, bool, usize)> = None;
         for a in &self.actions {
             match a {
                 Action::Call { call, .. } => calls.push(call.clone()),
                 Action::Play { seat, card } => played.push((*seat, *card)),
+                Action::Claim {
+                    seat,
+                    tricks,
+                    ruling,
+                } => claim = Some((*seat, *tricks, *ruling, played.len())),
             }
         }
 
@@ -218,6 +279,7 @@ impl TableState {
                 tricks_ns: 0,
                 tricks_ew: 0,
                 opening_lead_made: false,
+                claim: None,
             };
         }
 
@@ -234,6 +296,7 @@ impl TableState {
                 tricks_ns: 0,
                 tricks_ew: 0,
                 opening_lead_made: false,
+                claim: None,
             };
         };
 
@@ -259,7 +322,28 @@ impl TableState {
             }
         }
 
-        let play_done = completed.len() == 13;
+        // A claim ends the play: the claimer's side takes its tricks of those
+        // still to play, the other side the rest.
+        let claim = claim.map(|(seat, tricks, ruling, at_card)| {
+            let left = 13 - completed.len() as u8;
+            let tricks = tricks.min(left);
+            if matches!(seat, Direction::North | Direction::South) {
+                tricks_ns += tricks;
+                tricks_ew += left - tricks;
+            } else {
+                tricks_ew += tricks;
+                tricks_ns += left - tricks;
+            }
+            ClaimRecord {
+                seat,
+                tricks,
+                ruling,
+                at_trick: completed.len() + 1,
+                at_card,
+            }
+        });
+
+        let play_done = completed.len() == 13 || claim.is_some();
         let next_to_act = if play_done {
             None
         } else if let Some((last_seat, _)) = trick.last() {
@@ -287,6 +371,7 @@ impl TableState {
             completed_tricks: completed,
             tricks_ns,
             tricks_ew,
+            claim,
         }
     }
 
@@ -319,6 +404,7 @@ impl TableState {
             "passed_out": f.contract.is_none(),
             "contract": contract,
             "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
+            "claim": f.claim.as_ref().map(claim_json),
         }))
     }
 
@@ -404,10 +490,27 @@ impl TableState {
                 })).collect::<Vec<_>>(),
             })),
             "tricks": { "ns": f.tricks_ns, "ew": f.tricks_ew },
+            // Every card played so far, in order — with the deal and contract,
+            // the position a client's claim checker needs.
+            "plays": f.played.iter()
+                .map(|(_, c)| format!("{}{}", c.suit.to_char(), c.rank.to_char()))
+                .collect::<Vec<_>>(),
+            "claim": f.claim.as_ref().map(claim_json),
             "hands": hands,
             "legal": legal_actions,
         })
     }
+}
+
+/// A claim for the wire (snapshots, `board_complete`, the lobby).
+pub fn claim_json(c: &ClaimRecord) -> Value {
+    json!({
+        "seat": c.seat.to_char().to_string(),
+        "tricks": c.tricks,
+        "ruling": c.ruling,
+        "at_trick": c.at_trick,
+        "at_card": c.at_card,
+    })
 }
 
 fn current_lead_suit(f: &Folded) -> Option<Suit> {
@@ -691,5 +794,131 @@ mod tests {
         assert_eq!(snap["legal"]["kind"], "card");
         assert_eq!(snap["legal"]["seat"], "S");
         assert_eq!(snap["legal"]["cards"].as_array().unwrap().len(), 13);
+    }
+
+    // 3NT by East; South has led the ♠2.
+    fn three_nt_after_lead() -> TableState {
+        let mut t = setup();
+        apply_calls(
+            &mut t,
+            &[
+                (North, "Pass"),
+                (East, "1NT"),
+                (South, "Pass"),
+                (West, "3NT"),
+                (North, "Pass"),
+                (East, "Pass"),
+                (South, "Pass"),
+            ],
+        );
+        t.apply(Action::Play {
+            seat: South,
+            card: Card::new(Suit::Spades, bridge_types::Rank::Two),
+        })
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn claim_ends_the_play_and_splits_the_remaining_tricks() {
+        let mut t = three_nt_after_lead();
+        t.apply(Action::Claim {
+            seat: West, // dummy claims for declarer's side
+            tricks: 9,
+            ruling: false,
+        })
+        .unwrap();
+        let f = t.fold();
+        assert_eq!(f.phase, Phase::Complete);
+        assert_eq!(f.next_to_act, None);
+        assert_eq!((f.tricks_ew, f.tricks_ns), (9, 4));
+        let c = f.claim.unwrap();
+        assert_eq!((c.seat, c.tricks, c.at_trick, c.at_card), (West, 9, 1, 1));
+
+        let result = t.board_result_json().unwrap();
+        assert_eq!(result["contract"]["declarer_tricks"], 9);
+        assert_eq!(result["contract"]["made"], 0);
+        assert_eq!(result["claim"]["seat"], "W");
+        assert_eq!(result["claim"]["tricks"], 9);
+
+        let snap = t.snapshot(false);
+        assert_eq!(snap["phase"], "complete");
+        assert_eq!(snap["claim"]["at_card"], 1);
+        assert_eq!(snap["plays"], json!(["S2"]));
+    }
+
+    #[test]
+    fn a_defender_concedes_with_zero() {
+        let mut t = three_nt_after_lead();
+        t.apply(Action::Claim {
+            seat: North,
+            tricks: 0,
+            ruling: false,
+        })
+        .unwrap();
+        let f = t.fold();
+        assert_eq!((f.tricks_ns, f.tricks_ew), (0, 13));
+    }
+
+    #[test]
+    fn claims_are_refused_outside_the_play_or_beyond_the_tricks_left() {
+        let mut t = setup();
+        let err = t
+            .apply(Action::Claim {
+                seat: North,
+                tricks: 1,
+                ruling: false,
+            })
+            .unwrap_err();
+        assert!(err.contains("during the play"), "{err}");
+
+        let mut t = three_nt_after_lead();
+        let err = t
+            .apply(Action::Claim {
+                seat: East,
+                tricks: 14,
+                ruling: false,
+            })
+            .unwrap_err();
+        assert!(err.contains("only 13 remain"), "{err}");
+
+        t.apply(Action::Claim {
+            seat: East,
+            tricks: 13,
+            ruling: true,
+        })
+        .unwrap();
+        // Nothing follows a claim: not a card, not another claim.
+        assert!(t
+            .apply(Action::Play {
+                seat: West,
+                card: Card::new(Suit::Spades, bridge_types::Rank::Ten),
+            })
+            .is_err());
+        assert!(t
+            .apply(Action::Claim {
+                seat: East,
+                tricks: 1,
+                ruling: false,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn undo_takes_a_claim_back() {
+        let mut t = three_nt_after_lead();
+        let before = t.seq();
+        t.apply(Action::Claim {
+            seat: East,
+            tricks: 9,
+            ruling: false,
+        })
+        .unwrap();
+        t.undo_to(before).unwrap();
+        let f = t.fold();
+        assert_eq!(f.phase, Phase::Play);
+        assert_eq!(f.claim, None);
+        assert_eq!(f.next_to_act, Some(West));
+        assert_eq!(f.tricks_left(), 13);
     }
 }

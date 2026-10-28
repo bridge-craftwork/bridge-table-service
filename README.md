@@ -10,6 +10,7 @@ Hosts live bridge tables for [Bridge Classroom](https://bridge-classroom.com): t
 
 - **Event-sourced tables**: each table's state is a fold over its action log; undo (unlimited, Shark-style) is truncate-and-refold.
 - **Join tickets**: clients authenticate the WebSocket with a short-lived HMAC ticket minted by the bridge-classroom API (`TICKET_SECRET` shared between the two services); this service verifies offline.
+- **Claims**: a seated player sends `claim` (their side takes N of the tricks still to play, with `plays_seen`, the card count their browser checked it at; a mismatch is refused as `claim_stale`); the teacher sends `claim_ruling`. Players' claims are checked first in the browser by [`bridge-solver`](https://github.com/bridge-craftwork/bridge-solver)'s claim checker (WASM) and, with `VERIFY_CLAIMS`, again here by the same crate at the same release. See `src/claims.rs`.
 - **Sister crates**: bridge primitives come from [`bridge-types`](https://github.com/bridge-craftwork/bridge-types), PBN parsing from [`bridge-encodings`](https://github.com/bridge-craftwork/bridge-encodings), and rule-based cardplay from [`bridge-rulebot`](https://github.com/bridge-craftwork/bridge-rulebot) — only auction/play *legality* logic lives here (see `src/engine/`).
 
 ## Local development
@@ -71,6 +72,7 @@ colima stop && colima start --vz-rosetta   # one-time; persists across reboots
 | `BEN_URL` | `https://ben.bridge-craftwork.com` | BEN cardplay engine. **On the droplet set `BEN_URL=http://ben:8085`** in the compose block — BEN runs on the same `bridge-net` docker network, so calls should stay internal instead of hairpinning through the public edge. |
 | `BBA_URL` | `https://bba.harmonicsystems.com` | BBA bidding engine (Windows-VM hosted; public URL is the only route) |
 | `BOT_TIMEOUT_MS` | `20000` | Per-call budget for BEN cardplay requests — opening leads and early plays can legitimately take >8s even on a warm BEN |
+| `VERIFY_CLAIMS` | `true` | Re-check players' claims with bridge-solver before applying them. `false` trusts the claimer's browser check (it always runs there). Teacher rulings are never checked. |
 
 Bot seats use BBA for bidding (with a per-room predicted-auction prefix cache; divergence or undo re-requests with `auctionPrefix`) and BEN for cardplay (encodings mirror the frontend's `benClient.js`). Every suggestion is validated through the legality engine; on timeout (`BOT_TIMEOUT_MS` for BEN, 8s for BBA), error, or an illegal suggestion the seat falls back to Pass / a [`bridge-rulebot`](https://github.com/bridge-craftwork/bridge-rulebot) card (deterministic rule-based play — it also covers BEN's cold-start window), so a slow bot never freezes a table. BEN is pre-warmed at startup to absorb its ~20s model cold start. For testing, a client can send `"bot":"random"` (Pass bidding + instant deterministic RandomLegal, no BBA/BEN) or `"bot":"rules"` (real BBA auctions + instant bridge-rulebot cardplay, no BEN) in its `hello` frame to switch the whole room to that backend; the `welcome` frame reports the active mode as `"bot_mode":"real"|"random"|"rules"`.
 

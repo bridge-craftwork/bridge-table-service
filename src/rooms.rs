@@ -541,6 +541,7 @@ impl RoomInner {
             let seat = match action {
                 crate::table::Action::Call { seat, .. } => *seat,
                 crate::table::Action::Play { seat, .. } => *seat,
+                crate::table::Action::Claim { seat, .. } => *seat,
             };
             if !self.seat_bot_controlled(seat, true, now) {
                 return Some(i);

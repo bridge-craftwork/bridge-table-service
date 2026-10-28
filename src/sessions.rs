@@ -1496,6 +1496,14 @@ impl Session {
                 // Play, so the raw call returned null and the monitor showed
                 // such tables as forever mid-play with no result.
                 "result": inner.result_json(),
+                // The original deal and every card played: the position the
+                // console's claim checker (WASM) needs for the teacher's
+                // Claimable / Makable numbers. Teacher-only feed.
+                "deal": inner.table.board.deal.to_pbn(bridge_types::Direction::North),
+                "plays": f.played.iter()
+                    .map(|(_, c)| format!("{}{}", c.suit.to_char(), c.rank.to_char()))
+                    .collect::<Vec<_>>(),
+                "claim": f.claim.as_ref().map(crate::table::claim_json),
             }));
         }
         let kibitzers: Vec<Value> = {
@@ -2152,6 +2160,9 @@ mod tests {
         assert_eq!(tables[0]["table_id"], "s1-t1");
         assert_eq!(tables[0]["board_no"], 1);
         assert_eq!(tables[0]["phase"], "bidding");
+        assert!(tables[0]["deal"].as_str().unwrap().starts_with("N:"));
+        assert_eq!(tables[0]["plays"], json!([]));
+        assert!(tables[0]["claim"].is_null());
         let kib = lobby["kibitzers"].as_array().unwrap();
         assert_eq!(kib.len(), 1);
         assert_eq!(kib[0]["sub"], "g1");

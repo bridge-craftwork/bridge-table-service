@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "bridge-encodings"
 version = "0.1.0"
-source = "git+https://github.com/bridge-craftwork/bridge-encodings#3cc4b16a6d7707940fb5a7bedbfbfc2e60b172a1"
+source = "git+https://github.com/bridge-craftwork/bridge-encodings#d2d43dab25b0914b3dd09e3b49c3b916f521b0f3"
 dependencies = [
  "bridge-types",
  "thiserror 2.0.18",
@@ -164,10 +164,22 @@ dependencies = [
 [[package]]
 name = "bridge-rulebot"
 version = "0.1.0"
-source = "git+https://github.com/bridge-craftwork/bridge-rulebot#cd58131fa9e0d970dc00b96de5065a45b1761ee0"
+source = "git+https://github.com/bridge-craftwork/bridge-rulebot#10f5b6bdceb12f0667b7aa9342cfc6ab6239ca9b"
 dependencies = [
  "bridge-types",
  "web-time",
+]
+
+[[package]]
+name = "bridge-solver"
+version = "2.1.0"
+source = "git+https://github.com/bridge-craftwork/bridge-solver?tag=v2.1.0#9ee1cc060f1e228e9d0601fdab709934d94e84b5"
+dependencies = [
+ "bridge-encodings",
+ "bridge-types",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -179,6 +191,7 @@ dependencies = [
  "base64",
  "bridge-encodings",
  "bridge-rulebot",
+ "bridge-solver",
  "bridge-types",
  "chrono",
  "futures-util",
@@ -200,7 +213,7 @@ dependencies = [
 [[package]]
 name = "bridge-types"
 version = "0.1.0"
-source = "git+https://github.com/bridge-craftwork/bridge-types#3b26da0c6b2e1f084b0e0b55796f3f19d02947fd"
+source = "git+https://github.com/bridge-craftwork/bridge-types#cc759199dde99d3f650bfe383ec8817635d0a43f"
 
 [[package]]
 name = "bumpalo"
